@@ -7,8 +7,8 @@ import { pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
 
 let HOST = "127.0.0.1";
-let PORT = Number(process.env.KNOU_HELPER_PORT ?? 4317);
-let PROFILE_DIR = path.resolve(process.env.KNOU_PROFILE_DIR ?? ".knou-playwright-profile");
+let PORT = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317);
+let PROFILE_DIR = path.resolve(process.env.BROWSER_AUTOMATION_PROFILE_DIR ?? ".browser-automation-profile");
 const LOGIN_URL = "https://m.knou.ac.kr/login?service=https%3A%2F%2Fm.knou.ac.kr";
 const TISTORY_LOGIN_URL = "https://www.tistory.com/auth/login";
 const TISTORY_CUSTOM_HOSTS = new Set(
@@ -19,7 +19,7 @@ const TISTORY_CUSTOM_HOSTS = new Set(
 );
 const MAX_BODY_BYTES = 80_000_000;
 let allowedOrigins = new Set(
-  (process.env.KNOU_HELPER_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
+  (process.env.BROWSER_AUTOMATION_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean),
@@ -27,6 +27,12 @@ let allowedOrigins = new Set(
 let authorizePairedOrigin = () => false;
 
 let browserContext;
+let browserConnection;
+let workPage;
+let embeddedBrowserEndpoint = "";
+let embeddedAutomationPageUrl = "";
+let showEmbeddedBrowser = async () => undefined;
+let hideEmbeddedBrowser = async () => undefined;
 let activeServer;
 
 function json(response, status, value, origin = "") {
@@ -125,6 +131,38 @@ async function readBody(request) {
 async function getContext() {
   if (browserContext) return browserContext;
 
+  if (embeddedBrowserEndpoint) {
+    const deadline = Date.now() + 10_000;
+    let lastError;
+    while (Date.now() < deadline) {
+      try {
+        browserConnection = await chromium.connectOverCDP(embeddedBrowserEndpoint);
+        break;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+    if (!browserConnection) {
+      throw lastError ?? new Error("Electron 자동화 브라우저에 연결하지 못했습니다.");
+    }
+
+    const contexts = browserConnection.contexts();
+    browserContext = contexts[0];
+    workPage = contexts
+      .flatMap((context) => context.pages())
+      .find((page) => page.url() === embeddedAutomationPageUrl);
+    if (!browserContext || !workPage) {
+      throw new Error("Electron 자동화 브라우저 화면을 찾지 못했습니다.");
+    }
+    browserConnection.on("disconnected", () => {
+      browserConnection = undefined;
+      browserContext = undefined;
+      workPage = undefined;
+    });
+    return browserContext;
+  }
+
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
     channel: process.env.PLAYWRIGHT_CHANNEL ?? "chrome",
     headless: false,
@@ -138,8 +176,13 @@ async function getContext() {
 
 async function getWorkPage() {
   const context = await getContext();
+  if (workPage && !workPage.isClosed()) {
+    workPage.setDefaultTimeout(5_000);
+    return workPage;
+  }
   const pages = context.pages();
   const page = pages.find((candidate) => candidate.url() === "about:blank") ?? (await context.newPage());
+  workPage = page;
   page.setDefaultTimeout(5_000);
   return page;
 }
@@ -147,7 +190,16 @@ async function getWorkPage() {
 // 사람이 직접 확인·작업해야 하는 순간(로그인·검토 대기·직접 처리 안내)에만 방송대 창을 앞으로 가져옵니다.
 // 자동 이동·채우기·제출 단계에서는 포커스를 뺏지 않아 사용자가 그동안 다른 작업을 계속할 수 있습니다.
 async function surfaceForUser(page) {
+  if (embeddedBrowserEndpoint) {
+    await showEmbeddedBrowser();
+    return;
+  }
   await page.bringToFront().catch(() => undefined);
+}
+
+async function prepareBrowserInBackground() {
+  if (!embeddedBrowserEndpoint) return;
+  await hideEmbeddedBrowser();
 }
 
 async function firstVisible(locators) {
@@ -912,7 +964,7 @@ export async function submitPostForm(page, mode) {
     return {
       ok: false,
       code: "CAPTCHA_REQUIRED",
-      message: "방송대에서 CAPTCHA 확인이 필요합니다. 전용 Chrome에서 직접 완료한 뒤 다시 시도해 주세요.",
+      message: "방송대에서 CAPTCHA 확인이 필요합니다. 자동화 브라우저에서 직접 완료한 뒤 다시 시도해 주세요.",
     };
   }
 
@@ -1115,7 +1167,7 @@ async function openLogin() {
   return {
     ok: true,
     status: "login-opened",
-    message: "전용 Chrome 창을 열었습니다. 방송대 로그인을 완료한 뒤 이 창은 그대로 두세요.",
+    message: "Electron 자동화 브라우저를 열었습니다. 방송대 로그인을 완료한 뒤 창을 닫아도 됩니다.",
   };
 }
 
@@ -1171,6 +1223,7 @@ async function prepareTistoryDraft(body) {
     };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(manageUrl, { waitUntil: "domcontentloaded" });
   if (isTistoryLoginPage(page)) {
@@ -1180,7 +1233,7 @@ async function prepareTistoryDraft(body) {
       body: {
         ok: false,
         code: "TISTORY_LOGIN_REQUIRED",
-        message: "티스토리 로그인이 필요합니다. 열린 전용 Chrome에서 로그인한 뒤 다시 실행해 주세요.",
+        message: "티스토리 로그인이 필요합니다. 열린 자동화 브라우저에서 로그인한 뒤 다시 실행해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1194,7 +1247,7 @@ async function prepareTistoryDraft(body) {
       body: {
         ok: false,
         code: "TISTORY_EDITOR_NOT_FOUND",
-        message: "티스토리 글쓰기 화면을 찾지 못했습니다. 열린 Chrome에서 상태를 확인해 주세요.",
+        message: "티스토리 글쓰기 화면을 찾지 못했습니다. 열린 자동화 브라우저에서 상태를 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1291,6 +1344,7 @@ async function prepareTistoryModification(body) {
   if (!input.ok) return { status: 400, body: input };
 
   const postUrl = tistoryUrl(body.postUrl);
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(postUrl.href, { waitUntil: "domcontentloaded" });
   if (isTistoryLoginPage(page)) {
@@ -1300,7 +1354,7 @@ async function prepareTistoryModification(body) {
       body: {
         ok: false,
         code: "TISTORY_LOGIN_REQUIRED",
-        message: "티스토리 로그인이 필요합니다. 열린 전용 Chrome에서 로그인한 뒤 다시 실행해 주세요.",
+        message: "티스토리 로그인이 필요합니다. 열린 자동화 브라우저에서 로그인한 뒤 다시 실행해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1406,16 +1460,18 @@ async function prepareModification(body) {
     return { status: 400, body: { ok: false, code: "INVALID_HTML", message: "게시할 HTML 내용을 입력해 주세요." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(postUrl, { waitUntil: "domcontentloaded" });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
+    await surfaceForUser(page);
     return {
       status: 409,
       body: {
         ok: false,
         code: "LOGIN_REQUIRED",
-        message: "방송대 로그인이 필요합니다. 도우미의 로그인 창에서 로그인한 뒤 다시 시도해 주세요.",
+        message: "방송대 로그인이 필요합니다. 자동화 브라우저에서 로그인한 뒤 다시 시도해 주세요.",
       },
     };
   }
@@ -1427,7 +1483,7 @@ async function prepareModification(body) {
       body: {
         ok: false,
         code: "EDIT_CONTROL_NOT_FOUND",
-        message: "수정 버튼을 찾지 못했습니다. 전용 Chrome에서 로그인 상태와 수정 권한을 확인해 주세요.",
+        message: "수정 버튼을 찾지 못했습니다. 자동화 브라우저에서 로그인 상태와 수정 권한을 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1493,6 +1549,7 @@ async function autoLogin(body) {
     return { status: 400, body: { ok: false, code: "INVALID_PASSWORD", message: "비밀번호를 입력해 주세요." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
@@ -1502,7 +1559,7 @@ async function autoLogin(body) {
     await surfaceForUser(page);
     return {
       status: 422,
-      body: { ok: false, code: "LOGIN_FORM_NOT_FOUND", message: "로그인 입력란을 찾지 못했습니다. 전용 Chrome에서 직접 로그인해 주세요." },
+      body: { ok: false, code: "LOGIN_FORM_NOT_FOUND", message: "로그인 입력란을 찾지 못했습니다. 자동화 브라우저에서 직접 로그인해 주세요." },
     };
   }
 
@@ -1541,16 +1598,18 @@ async function prepareCreation(body) {
     return { status: 400, body: { ok: false, code: "INVALID_HTML", message: "게시할 HTML 내용을 입력해 주세요." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(boardUrl, { waitUntil: "domcontentloaded" });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
+    await surfaceForUser(page);
     return {
       status: 409,
       body: {
         ok: false,
         code: "LOGIN_REQUIRED",
-        message: "방송대 로그인이 필요합니다. 도우미의 로그인 창에서 로그인한 뒤 다시 시도해 주세요.",
+        message: "방송대 로그인이 필요합니다. 자동화 브라우저에서 로그인한 뒤 다시 시도해 주세요.",
       },
     };
   }
@@ -1562,7 +1621,7 @@ async function prepareCreation(body) {
       body: {
         ok: false,
         code: "WRITE_CONTROL_NOT_FOUND",
-        message: "글쓰기 버튼을 찾지 못했습니다. 전용 Chrome에서 로그인 상태와 작성 권한을 확인해 주세요.",
+        message: "글쓰기 버튼을 찾지 못했습니다. 자동화 브라우저에서 로그인 상태와 작성 권한을 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1579,7 +1638,7 @@ async function prepareCreation(body) {
         body: {
           ok: false,
           code: "CATEGORY_NOT_MATCHED",
-          message: `지역 분류에서 '${category.region}'에 해당하는 항목을 찾지 못했습니다. 전용 Chrome에서 분류를 직접 선택한 뒤 다시 시도해 주세요.`,
+          message: `지역 분류에서 '${category.region}'에 해당하는 항목을 찾지 못했습니다. 자동화 브라우저에서 분류를 직접 선택한 뒤 다시 시도해 주세요.`,
           pageUrl: writePage.url(),
         },
       };
@@ -1677,7 +1736,8 @@ function createServer() {
           ok: true,
           service: "growth-log-connector",
           message: authorized ? "연결 앱이 준비되었습니다." : "운영 프로그램 연결 승인이 필요합니다.",
-          browserOpen: Boolean(browserContext),
+          browserOpen: Boolean(browserContext || embeddedBrowserEndpoint),
+          browserMode: embeddedBrowserEndpoint ? "electron" : "chrome",
           authorized,
           safety: "confirmed-auto-final-submit",
         }, origin);
@@ -1739,22 +1799,26 @@ function createServer() {
         return;
       }
 
-      json(response, 404, { ok: false, message: "요청한 도우미 경로를 찾을 수 없습니다." }, origin);
+      json(response, 404, { ok: false, message: "요청한 자동화 서비스 경로를 찾을 수 없습니다." }, origin);
     } catch (error) {
       const message = error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.";
       json(response, 500, {
         ok: false,
-        code: "HELPER_ERROR",
-        message: `로컬 도우미 오류: ${message}`,
+        code: "AUTOMATION_ERROR",
+        message: `브라우저 자동화 오류: ${message}`,
       }, origin);
     }
   });
 }
 
-export async function startKnouHelper({
+export async function startBrowserAutomation({
   host = "127.0.0.1",
-  port = Number(process.env.KNOU_HELPER_PORT ?? 4317),
-  profileDir = path.resolve(process.env.KNOU_PROFILE_DIR ?? ".knou-playwright-profile"),
+  port = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317),
+  profileDir = path.resolve(process.env.BROWSER_AUTOMATION_PROFILE_DIR ?? ".browser-automation-profile"),
+  browserEndpoint = "",
+  automationPageUrl = "",
+  showAutomationWindow = async () => undefined,
+  hideAutomationWindow = async () => undefined,
   extraAllowedOrigins = [],
   isPairedOrigin = () => false,
   quiet = false,
@@ -1764,11 +1828,17 @@ export async function startKnouHelper({
   HOST = host;
   PORT = port;
   PROFILE_DIR = path.resolve(profileDir);
+  embeddedBrowserEndpoint = String(browserEndpoint ?? "").trim();
+  embeddedAutomationPageUrl = String(automationPageUrl ?? "").trim();
+  showEmbeddedBrowser = showAutomationWindow;
+  hideEmbeddedBrowser = hideAutomationWindow;
   authorizePairedOrigin = isPairedOrigin;
   allowedOrigins = new Set([
     ...allowedOrigins,
     ...extraAllowedOrigins.map((origin) => origin.trim()).filter(Boolean),
   ]);
+
+  if (embeddedBrowserEndpoint) await getContext();
 
   const server = createServer();
   await new Promise((resolve, reject) => {
@@ -1783,7 +1853,9 @@ export async function startKnouHelper({
 
   if (!quiet) {
     console.log(`Growth Log connector: http://${HOST}:${actualPort}`);
-    console.log(`Dedicated Chrome profile: ${PROFILE_DIR}`);
+    console.log(embeddedBrowserEndpoint
+      ? "Automation browser: Electron"
+      : `Automation browser profile: ${PROFILE_DIR}`);
     console.log("Keep this process open. Final submit runs only after an explicit confirmed request.");
   }
 
@@ -1794,8 +1866,12 @@ export async function startKnouHelper({
     openTistoryLogin,
     async close() {
       await new Promise((resolve) => server.close(resolve));
-      await browserContext?.close().catch(() => undefined);
+      if (!embeddedBrowserEndpoint) {
+        await browserContext?.close().catch(() => undefined);
+      }
+      browserConnection = undefined;
       browserContext = undefined;
+      workPage = undefined;
       activeServer = undefined;
     },
   };
@@ -1806,9 +1882,9 @@ const isDirectExecution = process.argv[1]
   && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
 if (isDirectExecution) {
-  const helper = await startKnouHelper();
+  const automation = await startBrowserAutomation();
   const shutdown = async () => {
-    await helper.close();
+    await automation.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

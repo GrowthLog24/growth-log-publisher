@@ -14,6 +14,7 @@
 /outputs/
 /work/
 /.knou-playwright-profile/
+/.browser-automation-profile/
 
 # Local tools and secrets
 /.claude/

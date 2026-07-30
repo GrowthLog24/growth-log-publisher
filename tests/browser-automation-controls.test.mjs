@@ -10,7 +10,7 @@ import {
   saveTistoryPostForm,
   submitPostForm,
   uploadTistoryAttachments,
-} from "../knou-helper.mjs";
+} from "../browser-automation.mjs";
 
 test("opens KNOU write and edit controls and clicks the confirmed final action", async () => {
   const browser = await chromium.launch({ channel: "chrome", headless: true });

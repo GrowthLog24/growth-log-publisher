@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { startKnouHelper } from "../knou-helper.mjs";
+import { startBrowserAutomation } from "../browser-automation.mjs";
 
 test("allows local development and requires pairing for deployed origins", async () => {
   const pairings = new Map([["https://operations.example", "00000000-0000-4000-8000-000000000000"]]);
-  const helper = await startKnouHelper({
+  const automation = await startBrowserAutomation({
     port: 0,
     isPairedOrigin: (origin, token) => pairings.get(origin) === token,
     quiet: true,
   });
-  const baseUrl = `http://${helper.host}:${helper.port}`;
+  const baseUrl = `http://${automation.host}:${automation.port}`;
 
   try {
     const removedDashboard = await fetch(`${baseUrl}/`);
@@ -55,6 +55,6 @@ test("allows local development and requires pairing for deployed origins", async
     assert.equal(sameOriginHealth.status, 200);
     assert.equal((await sameOriginHealth.json()).authorized, true);
   } finally {
-    await helper.close();
+    await automation.close();
   }
 });

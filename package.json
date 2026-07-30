@@ -3,18 +3,18 @@
   "productName": "Growth Log 연결 앱",
   "version": "0.1.0",
   "private": true,
-  "description": "Growth Log 운영 프로그램과 방송대 전용 Chrome을 안전하게 연결하는 로컬 앱",
+  "description": "Growth Log 운영 프로그램과 Electron 브라우저 자동화를 안전하게 연결하는 로컬 앱",
   "type": "module",
   "main": "src/main.mjs",
   "scripts": {
-    "sync-helper": "node scripts/sync-helper.mjs",
-    "prestart": "npm run sync-helper",
+    "sync-automation": "node scripts/sync-browser-automation.mjs",
+    "prestart": "npm run sync-automation",
     "start": "electron .",
-    "prepackage": "npm run sync-helper",
+    "prepackage": "npm run sync-automation",
     "package": "electron-forge package",
-    "premake": "npm run sync-helper",
+    "premake": "npm run sync-automation",
     "make": "electron-forge make",
-    "test": "node --check knou-helper.mjs && node --test tests/*.test.mjs"
+    "test": "node --check browser-automation.mjs && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "playwright-core": "1.61.1"

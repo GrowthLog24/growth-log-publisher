@@ -11,6 +11,12 @@ let PORT = Number(process.env.KNOU_HELPER_PORT ?? 4317);
 let PROFILE_DIR = path.resolve(process.env.KNOU_PROFILE_DIR ?? ".knou-playwright-profile");
 const LOGIN_URL = "https://m.knou.ac.kr/login?service=https%3A%2F%2Fm.knou.ac.kr";
 const TISTORY_LOGIN_URL = "https://www.tistory.com/auth/login";
+const TISTORY_CUSTOM_HOSTS = new Set(
+  (process.env.TISTORY_CUSTOM_HOSTS ?? "blog.growthlog.org")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+);
 const MAX_BODY_BYTES = 80_000_000;
 const helperDirectory = path.dirname(fileURLToPath(import.meta.url));
 let allowedOrigins = new Set(
@@ -72,7 +78,8 @@ function tistoryUrl(value) {
     const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
     const isTistoryHost = url.hostname === "tistory.com"
       || url.hostname === "www.tistory.com"
-      || url.hostname.endsWith(".tistory.com");
+      || url.hostname.endsWith(".tistory.com")
+      || TISTORY_CUSTOM_HOSTS.has(url.hostname);
     return url.protocol === "https:" && isTistoryHost ? url : null;
   } catch {
     return null;

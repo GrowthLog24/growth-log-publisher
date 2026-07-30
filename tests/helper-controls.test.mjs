@@ -103,8 +103,8 @@ test("does not bypass CAPTCHA before final submission", async () => {
 
 test("normalizes Tistory blog URLs and tags", () => {
   assert.equal(
-    normalizeTistoryManageUrl("growth-log-official.tistory.com/category/projects"),
-    "https://growth-log-official.tistory.com/manage/newpost/?type=post&returnURL=%2Fmanage%2Fposts%2F",
+    normalizeTistoryManageUrl("blog.growthlog.org/category/projects"),
+    "https://blog.growthlog.org/manage/newpost/?type=post&returnURL=%2Fmanage%2Fposts%2F",
   );
   assert.equal(normalizeTistoryManageUrl("https://example.com"), "");
   assert.deepEqual(

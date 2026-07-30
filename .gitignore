@@ -1,0 +1,23 @@
+# Dependencies
+/node_modules
+/.npm-cache/
+
+# Electron build output
+/out/
+/dist/
+
+# Generated runtime copy
+/generated/
+
+# Tests and local runtime data
+/coverage
+/outputs/
+/work/
+/.knou-playwright-profile/
+
+# Local tools and secrets
+/.claude/
+.DS_Store
+.env*
+*.pem
+*-debug.log*

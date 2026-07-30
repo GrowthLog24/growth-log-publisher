@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Growth Log 연결 앱</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f6f8fb;
+        color: #15233d;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 28px; }
+      main {
+        overflow: hidden;
+        border: 1px solid #dce4ef;
+        border-radius: 18px;
+        background: white;
+        box-shadow: 0 18px 50px rgba(28, 44, 74, 0.12);
+      }
+      header {
+        padding: 25px;
+        color: white;
+        background: linear-gradient(135deg, #10274c, #1768a8);
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        font-weight: 750;
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #58dfa7;
+        box-shadow: 0 0 0 5px rgba(88, 223, 167, 0.16);
+      }
+      h1 { margin: 16px 0 7px; font-size: 22px; letter-spacing: -0.03em; }
+      header p { margin: 0; color: #c8dbed; font-size: 12px; line-height: 1.55; }
+      section { padding: 22px 25px 25px; }
+      ol { display: grid; gap: 13px; margin: 0; padding: 0; list-style: none; counter-reset: step; }
+      li { display: grid; grid-template-columns: 28px 1fr; gap: 11px; align-items: start; font-size: 12px; line-height: 1.5; }
+      li::before {
+        counter-increment: step;
+        content: counter(step);
+        display: grid;
+        width: 28px;
+        height: 28px;
+        place-items: center;
+        border-radius: 9px;
+        background: #e9f4fd;
+        color: #1768a8;
+        font-size: 11px;
+        font-weight: 800;
+      }
+      strong { display: block; margin-bottom: 2px; }
+      span { color: #65748b; }
+      footer {
+        border-top: 1px solid #edf1f6;
+        padding: 15px 25px;
+        color: #8390a3;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="status"><i class="dot"></i> 연결 앱 실행 중</div>
+        <h1>Growth Log 연결 앱</h1>
+        <p>운영 프로그램과 이 컴퓨터의 방송대 전용 Chrome을 안전하게 연결합니다.</p>
+      </header>
+      <section>
+        <ol>
+          <li><div><strong>운영 프로그램을 여세요</strong><span>배포된 Growth Log 웹사이트에서 홍보 게시 화면으로 이동합니다.</span></div></li>
+          <li><div><strong>이 사이트 연결을 누르세요</strong><span>연결 요청이 표시되면 도메인을 확인하고 한 번만 허용합니다.</span></div></li>
+          <li><div><strong>최종 실행을 확인하세요</strong><span>운영 프로그램의 확인 모달에서 대상과 제목을 승인하면 작성·수정 및 최종 등록까지 실행됩니다.</span></div></li>
+        </ol>
+      </section>
+      <footer>창을 닫아도 연결 앱은 메뉴 막대에서 계속 실행됩니다. 로그인 세션과 연결 정보는 이 컴퓨터에만 저장됩니다.</footer>
+    </main>
+  </body>
+</html>

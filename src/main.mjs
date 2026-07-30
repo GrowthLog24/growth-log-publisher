@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, dialog, nativeImage, shell } from "electron";
+import { app, BrowserWindow, Menu, Tray, dialog, nativeImage } from "electron";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -140,23 +140,8 @@ async function openAutomationLogin() {
   }
 }
 
-async function openTistoryDashboard() {
-  const url = connector?.dashboardUrl ?? "http://127.0.0.1:4317/";
-  try {
-    await shell.openExternal(url);
-  } catch (error) {
-    await dialog.showMessageBox({
-      type: "error",
-      title: "자동화 화면 열기 오류",
-      message: "티스토리 임시저장 화면을 열지 못했습니다.",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
 function rebuildTrayMenu() {
   tray?.setContextMenu(Menu.buildFromTemplate([
-    { label: "티스토리 임시저장 열기", click: () => void openTistoryDashboard() },
     { label: "연결 상태 보기", click: showStatusWindow },
     { label: "방송대 로그인 창 열기", click: () => void openAutomationLogin() },
     { type: "separator" },
@@ -215,7 +200,7 @@ if (!gotSingleInstanceLock) {
   app.on("second-instance", (_event, args) => {
     const deepLink = findDeepLink(args);
     if (deepLink) void handleDeepLink(deepLink);
-    else void openTistoryDashboard();
+    else showStatusWindow();
   });
 
   app.on("open-url", (event, url) => {
@@ -235,7 +220,9 @@ if (!gotSingleInstanceLock) {
     try {
       const { startKnouHelper } = await import("../generated/knou-helper.mjs");
       connector = await startKnouHelper({
-        profileDir: path.join(app.getPath("userData"), "knou-playwright-profile"),
+        profileDir: app.isPackaged
+          ? path.join(app.getPath("userData"), "knou-playwright-profile")
+          : path.resolve(currentDirectory, "..", ".knou-playwright-profile"),
         isPairedOrigin: (origin, token) => pairings.get(origin) === token,
         quiet: true,
       });
@@ -256,7 +243,7 @@ if (!gotSingleInstanceLock) {
 
     const initialDeepLink = pendingDeepLink || findDeepLink(process.argv);
     if (initialDeepLink) void handleDeepLink(initialDeepLink);
-    else void openTistoryDashboard();
+    else showStatusWindow();
 
     app.on("activate", showStatusWindow);
     app.on("window-all-closed", () => {

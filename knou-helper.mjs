@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
 
 let HOST = "127.0.0.1";
@@ -18,7 +18,6 @@ const TISTORY_CUSTOM_HOSTS = new Set(
     .filter(Boolean),
 );
 const MAX_BODY_BYTES = 80_000_000;
-const helperDirectory = path.dirname(fileURLToPath(import.meta.url));
 let allowedOrigins = new Set(
   (process.env.KNOU_HELPER_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
     .split(",")
@@ -523,29 +522,107 @@ async function tistoryEditorImageSources(page) {
   const sources = [];
   for (const scope of searchScopes(page)) {
     const values = await scope.locator("img[src]").evaluateAll((images) => (
-      images.map((image) => image.getAttribute("src") || "").filter(Boolean)
+      images.flatMap((image) => [
+        image.getAttribute("src"),
+        image.getAttribute("data-src"),
+        image.getAttribute("data-origin-src"),
+        image.closest("[data-url]")?.getAttribute("data-url"),
+      ]).filter(Boolean)
     )).catch(() => []);
     sources.push(...values);
   }
   return new Set(sources);
 }
 
-async function uploadTistoryImage(page, filePath) {
-  const before = await tistoryEditorImageSources(page);
-  const fileInput = await firstExistingAcrossFrames(page, (scope) => [
-    scope.locator('input[type="file"][accept*="image" i]'),
-    scope.locator('input[type="file"]'),
-  ]);
+async function resetTistoryImageFocus(page) {
+  await page.keyboard.press("Escape").catch(() => undefined);
 
-  if (fileInput) {
-    await fileInput.setInputFiles(filePath);
+  const editor = await firstVisibleAcrossFrames(page, (scope) => [
+    scope.locator('[contenteditable="true"][role="textbox"]'),
+    scope.locator(".ProseMirror, .toastui-editor-contents[contenteditable='true'], .cke_editable"),
+    scope.locator('body[contenteditable="true"]'),
+    scope.locator('[contenteditable="true"]'),
+  ]);
+  if (!editor) return;
+
+  await editor.evaluate((element) => {
+    element.querySelectorAll("[data-mce-selected]").forEach((selected) => {
+      selected.removeAttribute("data-mce-selected");
+    });
+
+    const selection = element.ownerDocument.defaultView?.getSelection();
+    if (!selection) return;
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (element instanceof HTMLElement) element.focus();
+  }).catch(() => undefined);
+  await page.waitForTimeout(100);
+}
+
+async function findTistoryImageFileInput(page) {
+  for (const scope of searchScopes(page)) {
+    const inputs = scope.locator('input[type="file"]');
+    const candidates = [];
+    const count = Math.min(await inputs.count().catch(() => 0), 20);
+
+    for (let index = 0; index < count; index += 1) {
+      const input = inputs.nth(index);
+      const details = await input.evaluate((element) => {
+        const marker = [
+          element.id,
+          element.getAttribute("name"),
+          element.getAttribute("class"),
+          element.getAttribute("aria-label"),
+          element.getAttribute("data-testid"),
+          element.parentElement?.getAttribute("class"),
+          element.parentElement?.parentElement?.getAttribute("class"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const contextual = Boolean(element.closest(
+          'figure, [data-ke-type="image"], [class*="image-toolbar" i], '
+          + '[class*="image_control" i], [class*="image-control" i], '
+          + '[class*="image-action" i]',
+        )) || /(replace|change|modify|교체|변경|수정)/i.test(marker);
+        const accept = String(element.getAttribute("accept") ?? "").toLowerCase();
+        const score = (accept.includes("image") ? 30 : 0)
+          + (element.hasAttribute("multiple") ? 20 : 0)
+          + (/(attach|upload|file|첨부|업로드)/i.test(marker) ? 10 : 0);
+        return {
+          contextual,
+          disabled: element.disabled,
+          score,
+        };
+      }).catch(() => null);
+      if (!details || details.contextual || details.disabled) continue;
+      candidates.push({ input, score: details.score });
+    }
+
+    candidates.sort((left, right) => right.score - left.score);
+    if (candidates.length > 0) return candidates[0].input;
+  }
+  return null;
+}
+
+async function uploadTistoryImages(page, filePaths) {
+  await resetTistoryImageFocus(page);
+  const before = await tistoryEditorImageSources(page);
+  const fileInput = await findTistoryImageFileInput(page);
+  const canUseFileInput = fileInput && (
+    filePaths.length === 1
+    || await fileInput.getAttribute("multiple").then((value) => value !== null).catch(() => false)
+  );
+
+  if (canUseFileInput) {
+    await fileInput.setInputFiles(filePaths);
   } else {
     const attachmentControl = await firstVisibleAcrossFrames(page, (scope) => [
       scope.getByRole("button", { name: /^첨부$/ }),
       scope.locator('[role="button"][aria-label="첨부"]'),
       scope.locator("#attach-layer-btn"),
     ]);
-    if (!attachmentControl) return "";
+    if (!attachmentControl) return [];
     await attachmentControl.click();
 
     const imageMenuItem = await firstVisibleAcrossFrames(page, (scope) => [
@@ -553,39 +630,63 @@ async function uploadTistoryImage(page, filePath) {
       scope.getByRole("menuitem", { name: /^사진$/ }),
       scope.getByText(/^사진$/, { exact: true }),
     ]);
-    if (!imageMenuItem) return "";
+    if (!imageMenuItem) return [];
 
     const chooserPromise = page.waitForEvent("filechooser", { timeout: 5_000 }).catch(() => null);
     await imageMenuItem.click();
     const chooser = await chooserPromise;
-    if (!chooser) return "";
-    await chooser.setFiles(filePath);
+    if (!chooser || (filePaths.length > 1 && !chooser.isMultiple())) return [];
+    await chooser.setFiles(filePaths);
   }
 
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + Math.min(60_000, 20_000 + (filePaths.length * 5_000));
+  let latestUploads = [];
   while (Date.now() < deadline) {
     await page.waitForTimeout(350);
     for (const scope of searchScopes(page)) {
       const uploaded = await scope.locator("img[src]").evaluateAll((images, previousSources) => {
         const previous = new Set(previousSources);
-        const image = images.find((candidate) => {
-          const source = candidate.getAttribute("src") || "";
-          return source
-            && !previous.has(source)
-            && !source.startsWith("data:")
-            && !source.startsWith("blob:");
-        });
-        if (!image) return null;
-        const figure = image.closest("figure");
-        return {
-          url: image.getAttribute("src") || "",
-          figureHtml: (figure || image).outerHTML,
-        };
+        const results = [];
+        const seen = new Set();
+
+        for (const image of images) {
+          const candidates = [
+            image.getAttribute("src"),
+            image.getAttribute("data-src"),
+            image.getAttribute("data-origin-src"),
+            image.closest("[data-url]")?.getAttribute("data-url"),
+          ].filter(Boolean);
+          const url = candidates.find((candidate) => (
+            !previous.has(candidate)
+            && !candidate.startsWith("data:")
+            && !candidate.startsWith("blob:")
+            && !candidate.startsWith("growthlog-asset:")
+          ));
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+
+          const originalFigure = image.closest("figure");
+          const clonedRoot = (originalFigure || image).cloneNode(true);
+          const clonedImage = clonedRoot instanceof HTMLImageElement
+            ? clonedRoot
+            : clonedRoot.querySelector("img");
+          if (clonedImage) clonedImage.setAttribute("src", url);
+          results.push({
+            url,
+            figureHtml: clonedRoot.outerHTML,
+          });
+        }
+        return results;
       }, [...before]).catch(() => null);
-      if (uploaded?.url) return uploaded;
+      if (Array.isArray(uploaded) && uploaded.length > latestUploads.length) latestUploads = uploaded;
+      if (latestUploads.length >= filePaths.length) {
+        await resetTistoryImageFocus(page);
+        return latestUploads.slice(0, filePaths.length);
+      }
     }
   }
-  return null;
+  await resetTistoryImageFocus(page);
+  return latestUploads;
 }
 
 function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
@@ -612,7 +713,7 @@ function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
   return html.replace(figurePattern, figureHtml);
 }
 
-async function uploadTistoryAttachments(page, html, attachments) {
+export async function uploadTistoryAttachments(page, html, attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0) return { ok: true, html };
   if (attachments.length > 30) {
     return { ok: false, code: "TOO_MANY_IMAGES", message: "글 하나에는 이미지 30개까지 올릴 수 있습니다." };
@@ -621,6 +722,7 @@ async function uploadTistoryAttachments(page, html, attachments) {
   const tempDirectory = await fs.promises.mkdtemp(path.join(process.env.TMPDIR || "/tmp", "growth-log-tistory-"));
   let finalHtml = html;
   try {
+    const prepared = [];
     for (let index = 0; index < attachments.length; index += 1) {
       const attachment = attachments[index];
       const id = String(attachment?.id ?? "").trim();
@@ -635,15 +737,21 @@ async function uploadTistoryAttachments(page, html, attachments) {
 
       const filePath = path.join(tempDirectory, `${String(index + 1).padStart(2, "0")}${imageExtension(decoded.mimeType)}`);
       await fs.promises.writeFile(filePath, decoded.buffer, { mode: 0o600 });
-      const uploaded = await uploadTistoryImage(page, filePath);
-      if (!uploaded) {
-        return {
-          ok: false,
-          code: "TISTORY_IMAGE_UPLOAD_FAILED",
-          message: `'${String(attachment.name || `${index + 1}번째 이미지`)}' 업로드 결과를 확인하지 못했습니다.`,
-        };
-      }
-      finalHtml = replaceTistoryImagePlaceholder(finalHtml, id, uploaded);
+      prepared.push({ attachment, id, filePath });
+    }
+
+    const uploaded = await uploadTistoryImages(page, prepared.map((item) => item.filePath));
+    if (uploaded.length !== prepared.length) {
+      const next = prepared[uploaded.length];
+      return {
+        ok: false,
+        code: "TISTORY_IMAGE_UPLOAD_FAILED",
+        message: `'${String(next?.attachment?.name || "이미지")}'을 포함한 업로드 결과를 모두 확인하지 못했습니다. (${uploaded.length}/${prepared.length})`,
+      };
+    }
+
+    for (let index = 0; index < prepared.length; index += 1) {
+      finalHtml = replaceTistoryImagePlaceholder(finalHtml, prepared[index].id, uploaded[index]);
     }
   } finally {
     await fs.promises.rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -1540,47 +1648,6 @@ async function prepareCreation(body) {
   };
 }
 
-const WEB_ASSETS = new Map([
-  ["/", "index.html"],
-  ["/index.html", "index.html"],
-  ["/app.js", "app.js"],
-  ["/styles.css", "styles.css"],
-]);
-
-function resolveWebAsset(relativePath) {
-  const candidates = [
-    path.join(helperDirectory, "web", relativePath),
-    path.join(helperDirectory, "..", "web", relativePath),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? "";
-}
-
-function serveWebAsset(response, requestPath) {
-  const relativePath = WEB_ASSETS.get(requestPath);
-  const isZipLibrary = requestPath === "/vendor/jszip.min.js";
-  if (!relativePath && !isZipLibrary) return false;
-  const filePath = isZipLibrary
-    ? [
-      path.join(helperDirectory, "node_modules", "jszip", "dist", "jszip.min.js"),
-      path.join(helperDirectory, "..", "node_modules", "jszip", "dist", "jszip.min.js"),
-    ].find((candidate) => fs.existsSync(candidate))
-    : resolveWebAsset(relativePath);
-  if (!filePath) return false;
-
-  const contentType = requestPath.endsWith(".js")
-    ? "text/javascript; charset=utf-8"
-    : requestPath.endsWith(".css")
-      ? "text/css; charset=utf-8"
-      : "text/html; charset=utf-8";
-  response.writeHead(200, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-  });
-  fs.createReadStream(filePath).pipe(response);
-  return true;
-}
-
 function createServer() {
   return http.createServer(async (request, response) => {
     const origin = request.headers.origin ?? "";
@@ -1605,9 +1672,6 @@ function createServer() {
     }
 
     try {
-      const requestPath = new URL(request.url, `http://${HOST}`).pathname;
-      if (request.method === "GET" && serveWebAsset(response, requestPath)) return;
-
       if (request.method === "GET" && request.url === "/health") {
         json(response, 200, {
           ok: true,
@@ -1728,7 +1792,6 @@ export async function startKnouHelper({
     port: actualPort,
     openLogin,
     openTistoryLogin,
-    dashboardUrl: `http://${HOST}:${actualPort}/`,
     async close() {
       await new Promise((resolve) => server.close(resolve));
       await browserContext?.close().catch(() => undefined);

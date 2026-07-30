@@ -9,6 +9,7 @@ import {
   openWriteForm,
   saveTistoryPostForm,
   submitPostForm,
+  uploadTistoryAttachments,
 } from "../knou-helper.mjs";
 
 test("opens KNOU write and edit controls and clicks the confirmed final action", async () => {
@@ -164,6 +165,78 @@ test("fills a Tistory editor and uses its draft action without publishing", asyn
     const saved = await saveTistoryPostForm(page, "draft");
     assert.equal(saved.ok, true);
     assert.equal(await page.locator("body").getAttribute("data-saved"), "private");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("uploads multiple Tistory images in one file-input operation", async () => {
+  const browser = await chromium.launch({ channel: "chrome", headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.setContent(`
+      <div id="editor" role="textbox" contenteditable="true"><p>본문</p></div>
+      <input id="main-image-upload" type="file" accept="image/*" multiple />
+      <script>
+        const editor = document.querySelector("#editor");
+        const mainUpload = document.querySelector("#main-image-upload");
+
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") document.querySelector("#image-replace-toolbar")?.remove();
+        });
+
+        mainUpload.addEventListener("change", (event) => {
+          for (const file of event.currentTarget.files) {
+            const figure = document.createElement("figure");
+            const imageWrapper = document.createElement("span");
+            imageWrapper.dataset.url = "https://cdn.example/" + file.name;
+            const image = document.createElement("img");
+            image.src = "blob:preview-" + file.name;
+            image.tabIndex = 0;
+            image.dataset.mceSelected = "1";
+            imageWrapper.append(image);
+            figure.append(imageWrapper);
+            editor.append(figure);
+            image.focus();
+          }
+
+          document.querySelector("#image-replace-toolbar")?.remove();
+          const toolbar = document.createElement("div");
+          toolbar.id = "image-replace-toolbar";
+          toolbar.className = "image-toolbar";
+          toolbar.innerHTML = '<input id="replace-image-upload" type="file" accept="image/*" />';
+          document.body.prepend(toolbar);
+          document.body.dataset.mainUploads = String(event.currentTarget.files.length);
+          document.body.dataset.uploadEvents = String(Number(document.body.dataset.uploadEvents || 0) + 1);
+        });
+
+        document.addEventListener("change", (event) => {
+          if (event.target.id !== "replace-image-upload") return;
+          document.body.dataset.replacementUsed = "true";
+        });
+      </script>
+    `);
+
+    const result = await uploadTistoryAttachments(
+      page,
+      [
+        '<figure data-ke-type="image"><img src="growthlog-asset://asset-1" alt="첫 이미지" /></figure>',
+        '<figure data-ke-type="image"><img src="growthlog-asset://asset-2" alt="둘째 이미지" /></figure>',
+      ].join("\n"),
+      [
+        { id: "asset-1", name: "first.jpg", dataUrl: "data:image/jpeg;base64,AA==" },
+        { id: "asset-2", name: "second.jpg", dataUrl: "data:image/jpeg;base64,AQ==" },
+      ],
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(await page.locator("body").getAttribute("data-main-uploads"), "2");
+    assert.equal(await page.locator("body").getAttribute("data-upload-events"), "1");
+    assert.equal(await page.locator("body").getAttribute("data-replacement-used"), null);
+    assert.doesNotMatch(result.html, /growthlog-asset:\/\//);
+    assert.match(result.html, /https:\/\/cdn\.example\/01\.jpg/);
+    assert.match(result.html, /https:\/\/cdn\.example\/02\.jpg/);
   } finally {
     await browser.close();
   }

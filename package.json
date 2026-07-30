@@ -14,11 +14,9 @@
     "package": "electron-forge package",
     "premake": "npm run sync-helper",
     "make": "electron-forge make",
-    "helper": "node knou-helper.mjs",
-    "test": "node --check knou-helper.mjs && node --check web/app.js && node --test tests/*.test.mjs"
+    "test": "node --check knou-helper.mjs && node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "jszip": "^3.10.1",
     "playwright-core": "1.61.1"
   },
   "devDependencies": {

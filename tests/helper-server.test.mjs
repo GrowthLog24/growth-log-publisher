@@ -12,13 +12,11 @@ test("allows local development and requires pairing for deployed origins", async
   const baseUrl = `http://${helper.host}:${helper.port}`;
 
   try {
-    const dashboard = await fetch(`${baseUrl}/`);
-    assert.equal(dashboard.status, 200);
-    assert.match(await dashboard.text(), /티스토리 임시저장/);
+    const removedDashboard = await fetch(`${baseUrl}/`);
+    assert.equal(removedDashboard.status, 404);
 
-    const zipLibrary = await fetch(`${baseUrl}/vendor/jszip.min.js`);
-    assert.equal(zipLibrary.status, 200);
-    assert.match(zipLibrary.headers.get("content-type"), /javascript/);
+    const removedZipLibrary = await fetch(`${baseUrl}/vendor/jszip.min.js`);
+    assert.equal(removedZipLibrary.status, 404);
 
     const localHealth = await fetch(`${baseUrl}/health`, {
       headers: { Origin: "http://localhost:3000" },

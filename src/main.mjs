@@ -297,9 +297,10 @@ if (!gotSingleInstanceLock) {
     void handleDeepLink(url);
   });
 
-  if (process.defaultApp && process.argv[1]) {
-    app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
-  } else {
+  // 개발용 Electron 실행 파일을 URL handler로 등록하면 macOS가 앱 경로 없이
+  // Electron만 다시 실행해 기본 시작 화면을 띄운다. 배포된 앱의 Info.plist가
+  // protocol을 등록하므로, 실제 패키지 앱에서만 기본 handler로 설정한다.
+  if (!process.defaultApp) {
     app.setAsDefaultProtocolClient(PROTOCOL);
   }
 

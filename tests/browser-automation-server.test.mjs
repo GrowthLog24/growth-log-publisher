@@ -1,6 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { startBrowserAutomation } from "../browser-automation.mjs";
+import { createBrowserTaskQueue, startBrowserAutomation } from "../browser-automation.mjs";
+
+test("runs concurrent browser requests one at a time and continues after a failure", async () => {
+  const queue = createBrowserTaskQueue();
+  const order = [];
+  let active = 0;
+  let maxActive = 0;
+  const run = (name, fail = false) => queue.run(async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    order.push(`${name}:start`);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    active -= 1;
+    if (fail) throw new Error(`${name} failed`);
+    order.push(`${name}:end`);
+    return name;
+  });
+
+  const first = run("first");
+  const second = run("second", true);
+  const third = run("third");
+
+  assert.equal(await first, "first");
+  await assert.rejects(second, /second failed/);
+  assert.equal(await third, "third");
+  assert.equal(maxActive, 1);
+  assert.deepEqual(order, ["first:start", "first:end", "second:start", "third:start", "third:end"]);
+  assert.equal(queue.pending, 0);
+});
 
 test("allows local development and requires pairing for deployed origins", async () => {
   const pairings = new Map([["https://operations.example", "00000000-0000-4000-8000-000000000000"]]);

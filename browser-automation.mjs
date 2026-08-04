@@ -18,6 +18,16 @@ const TISTORY_CUSTOM_HOSTS = new Set(
     .filter(Boolean),
 );
 const MAX_BODY_BYTES = 80_000_000;
+
+function positiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+const ACTION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_ACTION_TIMEOUT_MS, 20_000);
+const NAVIGATION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_NAVIGATION_TIMEOUT_MS, 30_000);
+const POST_FORM_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_POST_FORM_TIMEOUT_MS, 30_000);
+const POST_COMPLETION_PATTERN = /(등록|저장).{0,20}(완료|되었습니다|성공)|완료되었습니다/;
 let allowedOrigins = new Set(
   (process.env.BROWSER_AUTOMATION_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
     .split(",")
@@ -34,6 +44,31 @@ let embeddedAutomationPageUrl = "";
 let showEmbeddedBrowser = async () => undefined;
 let hideEmbeddedBrowser = async () => undefined;
 let activeServer;
+
+// 하나의 자동화 탭을 여러 요청이 동시에 조작하면 페이지 이동과 입력이 서로
+// 덮어씌워집니다. 모든 브라우저 작업은 이 큐를 통해 한 건씩 실행합니다.
+export function createBrowserTaskQueue() {
+  let tail = Promise.resolve();
+  let pending = 0;
+
+  return {
+    get pending() {
+      return pending;
+    },
+    async run(task) {
+      pending += 1;
+      const current = tail.then(() => task());
+      tail = current.catch(() => undefined);
+      try {
+        return await current;
+      } finally {
+        pending -= 1;
+      }
+    },
+  };
+}
+
+const browserTaskQueue = createBrowserTaskQueue();
 
 function json(response, status, value, origin = "") {
   response.writeHead(status, {
@@ -177,13 +212,13 @@ async function getContext() {
 async function getWorkPage() {
   const context = await getContext();
   if (workPage && !workPage.isClosed()) {
-    workPage.setDefaultTimeout(5_000);
+    workPage.setDefaultTimeout(ACTION_TIMEOUT_MS);
     return workPage;
   }
   const pages = context.pages();
   const page = pages.find((candidate) => candidate.url() === "about:blank") ?? (await context.newPage());
   workPage = page;
-  page.setDefaultTimeout(5_000);
+  page.setDefaultTimeout(ACTION_TIMEOUT_MS);
   return page;
 }
 
@@ -337,7 +372,7 @@ async function acceptWriteAccessibilityNotice(page) {
   return false;
 }
 
-async function waitForPostForm(page, timeoutMs = 7_000) {
+async function waitForPostForm(page, timeoutMs = POST_FORM_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await acceptWriteAccessibilityNotice(page);
@@ -353,7 +388,7 @@ async function clickFormControl(page, createLocators) {
 
   await control.scrollIntoViewIfNeeded().catch(() => undefined);
   const popupPromise = page.waitForEvent("popup", { timeout: 1_500 }).catch(() => null);
-  await control.click({ timeout: 7_000 }).catch(async () => {
+  await control.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
     await control.evaluate((element) => {
       if (element instanceof HTMLElement) element.click();
     });
@@ -361,9 +396,8 @@ async function clickFormControl(page, createLocators) {
 
   const popup = await popupPromise;
   const targetPage = popup ?? page;
-  await targetPage.waitForLoadState("domcontentloaded", { timeout: 7_000 }).catch(() => undefined);
-  await waitForPostForm(targetPage);
-  return targetPage;
+  await targetPage.waitForLoadState("domcontentloaded", { timeout: NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
+  return (await waitForPostForm(targetPage)) ? targetPage : null;
 }
 
 export function openEditForm(page) {
@@ -456,6 +490,82 @@ async function fillHtml(page, html) {
   }
 
   return filledEditor;
+}
+
+function namoSourceLocators(scope) {
+  return [
+    scope.locator('textarea#NamoSE_editorhtml_editor'),
+    scope.locator('textarea[id$="_editorhtml_editor" i]'),
+    scope.locator('textarea.NamoSE_html_frame'),
+    scope.locator('textarea[title*="HTML 편집 모드"]'),
+  ];
+}
+
+function namoHtmlTabLocators(scope) {
+  return [
+    scope.locator('#NamoSE_editorhtml, [id$="_editorhtml" i]'),
+    scope.getByRole("tab", { name: /^HTML$/i }),
+    scope.getByRole("button", { name: /^HTML$/i }),
+    scope.getByRole("link", { name: /^HTML$/i }),
+    scope.locator("li, a, button, span").filter({ hasText: /^HTML$/i }),
+  ];
+}
+
+async function findVisibleNamoSource(page) {
+  for (const scope of searchScopes(page)) {
+    for (const locator of namoSourceLocators(scope)) {
+      if ((await locator.count().catch(() => 0)) === 0) continue;
+      const candidate = locator.first();
+      if (await candidate.isVisible().catch(() => false)) return candidate;
+    }
+  }
+  return null;
+}
+
+export async function activateNamoHtmlMode(page) {
+  if (await findVisibleNamoSource(page)) return true;
+
+  const htmlTab = await firstVisibleAcrossFrames(page, namoHtmlTabLocators);
+  if (!htmlTab) return false;
+
+  await htmlTab.scrollIntoViewIfNeeded().catch(() => undefined);
+  await htmlTab.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
+    await htmlTab.evaluate((element) => {
+      if (element instanceof HTMLElement) element.click();
+    });
+  });
+
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await findVisibleNamoSource(page)) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
+}
+
+export async function fillKnouHtml(page, html) {
+  const namoReady = await activateNamoHtmlMode(page);
+  if (!namoReady) return fillHtml(page, html);
+
+  const source = await findVisibleNamoSource(page);
+  if (!source) return false;
+
+  await source.fill(html);
+  await source.evaluate((element) => {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "End" }));
+    element.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+  });
+  return (await source.inputValue()) === html;
+}
+
+async function fillKnouPostForm(page, title, html) {
+  const [titleFilled, htmlFilled] = await Promise.all([
+    fillTitle(page, title.trim()),
+    fillKnouHtml(page, html),
+  ]);
+  return { titleFilled, htmlFilled };
 }
 
 async function selectTistoryCategory(page, category) {
@@ -979,16 +1089,27 @@ export async function submitPostForm(page, mode) {
     };
   }
 
+  const initialUrl = page.url();
   let dialogMessage = "";
+  let resolveSuccessDialog;
+  const successDialog = new Promise((resolve) => {
+    resolveSuccessDialog = resolve;
+  });
+  const navigation = page.waitForURL((url) => url.href !== initialUrl, {
+    timeout: NAVIGATION_TIMEOUT_MS,
+  }).then(() => true).catch(() => false);
   const acceptDialog = async (dialog) => {
     dialogMessage = dialog.message();
+    const success = dialog.type() === "alert"
+      && POST_COMPLETION_PATTERN.test(dialogMessage);
     await dialog.accept();
+    if (success) resolveSuccessDialog(true);
   };
   page.on("dialog", acceptDialog);
 
   try {
     await submitControl.scrollIntoViewIfNeeded().catch(() => undefined);
-    await submitControl.click({ timeout: 7_000 }).catch(async () => {
+    await submitControl.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
       await submitControl.evaluate((element) => {
         if (element instanceof HTMLElement) element.click();
       });
@@ -999,8 +1120,21 @@ export async function submitPostForm(page, mode) {
     ]);
     if (confirmControl) await confirmControl.click();
 
-    await page.waitForLoadState("domcontentloaded", { timeout: 7_000 }).catch(() => undefined);
-    await page.waitForTimeout(800);
+    const completionText = page.waitForFunction((patternSource) => {
+      const text = document.body?.innerText ?? "";
+      return new RegExp(patternSource).test(text);
+    }, POST_COMPLETION_PATTERN.source, {
+      timeout: NAVIGATION_TIMEOUT_MS,
+    }).then(() => true).catch(() => false);
+    const confirmed = await Promise.race([navigation, completionText, successDialog]);
+    if (!confirmed) {
+      return {
+        ok: false,
+        code: "SUBMIT_NOT_CONFIRMED",
+        message: "최종 버튼을 눌렀지만 방송대의 게시 완료를 확인하지 못했습니다. 열린 브라우저에서 상태를 확인해 주세요.",
+      };
+    }
+    await page.waitForTimeout(500);
   } finally {
     page.off("dialog", acceptDialog);
   }
@@ -1462,7 +1596,7 @@ async function prepareModification(body) {
 
   await prepareBrowserInBackground();
   const page = await getWorkPage();
-  await page.goto(postUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
     await surfaceForUser(page);
@@ -1478,6 +1612,7 @@ async function prepareModification(body) {
 
   const editPage = await openEditForm(page);
   if (!editPage) {
+    await surfaceForUser(page);
     return {
       status: 422,
       body: {
@@ -1489,7 +1624,7 @@ async function prepareModification(body) {
     };
   }
 
-  const [titleFilled, htmlFilled] = await Promise.all([fillTitle(editPage, title.trim()), fillHtml(editPage, html)]);
+  const { titleFilled, htmlFilled } = await fillKnouPostForm(editPage, title, html);
 
   if (!titleFilled || !htmlFilled) {
     await surfaceForUser(editPage);
@@ -1507,6 +1642,7 @@ async function prepareModification(body) {
   if (confirmFinalSubmit === true) {
     const submitted = await submitPostForm(editPage, "modify");
     if (!submitted.ok) {
+      await surfaceForUser(editPage);
       return {
         status: 422,
         body: {
@@ -1600,7 +1736,7 @@ async function prepareCreation(body) {
 
   await prepareBrowserInBackground();
   const page = await getWorkPage();
-  await page.goto(boardUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(boardUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
     await surfaceForUser(page);
@@ -1616,6 +1752,7 @@ async function prepareCreation(body) {
 
   const writePage = await openWriteForm(page);
   if (!writePage) {
+    await surfaceForUser(page);
     return {
       status: 422,
       body: {
@@ -1645,7 +1782,7 @@ async function prepareCreation(body) {
     }
   }
 
-  const [titleFilled, htmlFilled] = await Promise.all([fillTitle(writePage, title.trim()), fillHtml(writePage, html)]);
+  const { titleFilled, htmlFilled } = await fillKnouPostForm(writePage, title, html);
 
   if (!titleFilled || !htmlFilled) {
     await surfaceForUser(writePage);
@@ -1663,6 +1800,7 @@ async function prepareCreation(body) {
   if (confirmFinalSubmit === true) {
     const submitted = await submitPostForm(writePage, "create");
     if (!submitted.ok) {
+      await surfaceForUser(writePage);
       return {
         status: 422,
         body: {
@@ -1707,6 +1845,24 @@ async function prepareCreation(body) {
   };
 }
 
+async function respondWithBrowserTask(response, origin, task) {
+  const result = await browserTaskQueue.run(task);
+  const isHttpResult = result
+    && Number.isInteger(result.status)
+    && Object.prototype.hasOwnProperty.call(result, "body");
+  json(
+    response,
+    isHttpResult ? result.status : 200,
+    isHttpResult ? result.body : result,
+    origin,
+  );
+}
+
+async function respondWithBodyBrowserTask(request, response, origin, task) {
+  const body = await readBody(request);
+  await respondWithBrowserTask(response, origin, () => task(body));
+}
+
 function createServer() {
   return http.createServer(async (request, response) => {
     const origin = request.headers.origin ?? "";
@@ -1738,6 +1894,7 @@ function createServer() {
           message: authorized ? "연결 앱이 준비되었습니다." : "운영 프로그램 연결 승인이 필요합니다.",
           browserOpen: Boolean(browserContext || embeddedBrowserEndpoint),
           browserMode: embeddedBrowserEndpoint ? "electron" : "chrome",
+          queuedBrowserTasks: browserTaskQueue.pending,
           authorized,
           safety: "confirmed-auto-final-submit",
         }, origin);
@@ -1754,48 +1911,42 @@ function createServer() {
       }
 
       if (request.method === "POST" && request.url === "/login") {
-        json(response, 200, await openLogin(), origin);
+        await respondWithBrowserTask(response, origin, openLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/login-auto") {
-        const result = await autoLogin(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, autoLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/login") {
-        json(response, 200, await openTistoryLogin(await readBody(request)), origin);
+        await respondWithBodyBrowserTask(request, response, origin, openTistoryLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/draft") {
-        const result = await prepareTistoryDraft(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryDraft);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/drafts") {
-        const result = await prepareTistoryDraftBatch(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryDraftBatch);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/modify") {
-        const result = await prepareTistoryModification(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryModification);
         return;
       }
 
       if (request.method === "POST" && request.url === "/modify") {
-        const result = await prepareModification(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareModification);
         return;
       }
 
       if (request.method === "POST" && request.url === "/create") {
-        const result = await prepareCreation(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareCreation);
         return;
       }
 

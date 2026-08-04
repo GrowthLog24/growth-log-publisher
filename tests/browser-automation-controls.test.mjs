@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { chromium } from "playwright-core";
 import {
+  fillKnouHtml,
   fillTistoryPostForm,
   normalizeTistoryManageUrl,
   normalizeTistoryTags,
@@ -45,6 +46,7 @@ test("opens KNOU write and edit controls and clicks the confirmed final action",
         document.querySelector("#write-form").addEventListener("submit", (event) => {
           event.preventDefault();
           document.body.dataset.submitted = "write";
+          window.alert("게시글 등록이 완료되었습니다.");
         });
       </script>
     `);
@@ -68,6 +70,7 @@ test("opens KNOU write and edit controls and clicks the confirmed final action",
         document.querySelector("#edit-form").addEventListener("submit", (event) => {
           event.preventDefault();
           document.body.dataset.submitted = "edit";
+          window.alert("게시글 저장이 완료되었습니다.");
         });
       </script>
     `);
@@ -76,6 +79,38 @@ test("opens KNOU write and edit controls and clicks the confirmed final action",
     assert.equal(await page.locator("#artclSj").isVisible(), true);
     assert.equal((await submitPostForm(page, "modify")).ok, true);
     assert.equal(await page.locator("body").getAttribute("data-submitted"), "edit");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("switches Namo to HTML mode and fills the exact source textarea", async () => {
+  const browser = await chromium.launch({ channel: "chrome", headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.setContent(`
+      <button id="NamoSE_editorhtml" type="button">HTML</button>
+      <textarea
+        id="NamoSE_editorhtml_editor"
+        class="NamoSE_html_frame"
+        title="HTML 편집 모드"
+        style="display: none; width: 500px; height: 200px"
+      ></textarea>
+      <script>
+        document.querySelector("#NamoSE_editorhtml").addEventListener("click", () => {
+          document.querySelector("#NamoSE_editorhtml_editor").style.display = "block";
+        });
+        document.querySelector("#NamoSE_editorhtml_editor").addEventListener("change", () => {
+          document.body.dataset.sourceChanged = "true";
+        });
+      </script>
+    `);
+
+    const html = "<p><strong>방송대 본문</strong></p>";
+    assert.equal(await fillKnouHtml(page, html), true);
+    assert.equal(await page.locator("#NamoSE_editorhtml_editor").inputValue(), html);
+    assert.equal(await page.locator("body").getAttribute("data-source-changed"), "true");
   } finally {
     await browser.close();
   }

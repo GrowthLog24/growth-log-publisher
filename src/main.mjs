@@ -14,8 +14,10 @@ let connector;
 let tray;
 let statusWindow;
 let automationWindow;
+let automationPopupWindow;
 let pendingDeepLink = "";
 let isQuitting = false;
+let keepAutomationInBackground = false;
 
 async function reserveLoopbackPort() {
   return new Promise((resolve, reject) => {
@@ -184,16 +186,31 @@ async function createAutomationWindow() {
       action: "allow",
       overrideBrowserWindowOptions: {
         parent: automationWindow,
+        show: false,
         webPreferences: automationWebPreferences,
       },
     };
   });
   automationWindow.webContents.on("did-create-window", (window) => {
+    automationPopupWindow = window;
     window.removeMenu();
+    window.on("minimize", () => {
+      keepAutomationInBackground = true;
+    });
+    window.on("close", () => {
+      if (!isQuitting) keepAutomationInBackground = true;
+    });
+    window.on("closed", () => {
+      if (automationPopupWindow === window) automationPopupWindow = undefined;
+    });
+  });
+  automationWindow.on("minimize", () => {
+    keepAutomationInBackground = true;
   });
   automationWindow.on("close", (event) => {
     if (isQuitting) return;
     event.preventDefault();
+    keepAutomationInBackground = true;
     automationWindow?.hide();
   });
   automationWindow.on("closed", () => {
@@ -203,15 +220,24 @@ async function createAutomationWindow() {
   return automationWindow;
 }
 
-function showAutomationWindow() {
-  if (!automationWindow || automationWindow.isDestroyed()) return;
-  automationWindow.show();
-  automationWindow.focus();
+function showAutomationWindow(force = false) {
+  const target = automationPopupWindow && !automationPopupWindow.isDestroyed()
+    ? automationPopupWindow
+    : automationWindow;
+  if (!target || target.isDestroyed() || (!force && keepAutomationInBackground)) return;
+  if (force) {
+    keepAutomationInBackground = false;
+    if (target.isMinimized()) target.restore();
+    target.show();
+    target.focus();
+    return;
+  }
+  target.showInactive();
 }
 
 function hideAutomationWindow() {
-  if (!automationWindow || automationWindow.isDestroyed()) return;
-  automationWindow.hide();
+  if (automationWindow && !automationWindow.isDestroyed()) automationWindow.hide();
+  if (automationPopupWindow && !automationPopupWindow.isDestroyed()) automationPopupWindow.hide();
 }
 
 async function openAutomationLogin() {
@@ -230,7 +256,7 @@ async function openAutomationLogin() {
 function rebuildTrayMenu() {
   tray?.setContextMenu(Menu.buildFromTemplate([
     { label: "연결 상태 보기", click: showStatusWindow },
-    { label: "자동화 브라우저 보기", click: showAutomationWindow },
+    { label: "자동화 브라우저 보기", click: () => showAutomationWindow(true) },
     { label: "방송대 로그인 창 열기", click: () => void openAutomationLogin() },
     { type: "separator" },
     {

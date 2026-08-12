@@ -8,10 +8,25 @@ import {
   normalizeTistoryTags,
   openEditForm,
   openWriteForm,
+  resolvePostingRoundColumns,
   saveTistoryPostForm,
   submitPostForm,
   uploadTistoryAttachments,
 } from "../browser-automation.mjs";
+
+test("maps or creates a complete posting-round column group", () => {
+  assert.deepEqual(resolvePostingRoundColumns(["번호", "1차 게시", "1차 게시 제목", "1차 링크", "1차 소개"], 1), {
+    names: ["1차 게시", "1차 게시 제목", "1차 링크", "1차 소개"],
+    indexes: [1, 2, 3, 4],
+    insertAt: -1,
+  });
+  assert.deepEqual(resolvePostingRoundColumns(["번호"], 2), {
+    names: ["2차 게시", "2차 게시 제목", "2차 링크", "2차 소개"],
+    indexes: [1, 2, 3, 4],
+    insertAt: 1,
+  });
+  assert.throws(() => resolvePostingRoundColumns(["번호", "3차 게시"], 3), /3차 열 구조가 불완전/);
+});
 
 test("opens KNOU write and edit controls and clicks the confirmed final action", async () => {
   const browser = await chromium.launch({ channel: "chrome", headless: true });

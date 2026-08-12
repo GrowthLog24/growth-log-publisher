@@ -3,18 +3,33 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
 
 let HOST = "127.0.0.1";
-let PORT = Number(process.env.KNOU_HELPER_PORT ?? 4317);
-let PROFILE_DIR = path.resolve(process.env.KNOU_PROFILE_DIR ?? ".knou-playwright-profile");
+let PORT = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317);
+let PROFILE_DIR = path.resolve(process.env.BROWSER_AUTOMATION_PROFILE_DIR ?? ".browser-automation-profile");
 const LOGIN_URL = "https://m.knou.ac.kr/login?service=https%3A%2F%2Fm.knou.ac.kr";
 const TISTORY_LOGIN_URL = "https://www.tistory.com/auth/login";
+const TISTORY_CUSTOM_HOSTS = new Set(
+  (process.env.TISTORY_CUSTOM_HOSTS ?? "blog.growthlog.org")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+);
 const MAX_BODY_BYTES = 80_000_000;
-const helperDirectory = path.dirname(fileURLToPath(import.meta.url));
+
+function positiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+const ACTION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_ACTION_TIMEOUT_MS, 20_000);
+const NAVIGATION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_NAVIGATION_TIMEOUT_MS, 30_000);
+const POST_FORM_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_POST_FORM_TIMEOUT_MS, 30_000);
+const POST_COMPLETION_PATTERN = /(등록|저장).{0,20}(완료|되었습니다|성공)|완료되었습니다/;
 let allowedOrigins = new Set(
-  (process.env.KNOU_HELPER_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
+  (process.env.BROWSER_AUTOMATION_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean),
@@ -22,7 +37,38 @@ let allowedOrigins = new Set(
 let authorizePairedOrigin = () => false;
 
 let browserContext;
+let browserConnection;
+let workPage;
+let embeddedBrowserEndpoint = "";
+let embeddedAutomationPageUrl = "";
+let showEmbeddedBrowser = async () => undefined;
+let hideEmbeddedBrowser = async () => undefined;
 let activeServer;
+
+// 하나의 자동화 탭을 여러 요청이 동시에 조작하면 페이지 이동과 입력이 서로
+// 덮어씌워집니다. 모든 브라우저 작업은 이 큐를 통해 한 건씩 실행합니다.
+export function createBrowserTaskQueue() {
+  let tail = Promise.resolve();
+  let pending = 0;
+
+  return {
+    get pending() {
+      return pending;
+    },
+    async run(task) {
+      pending += 1;
+      const current = tail.then(() => task());
+      tail = current.catch(() => undefined);
+      try {
+        return await current;
+      } finally {
+        pending -= 1;
+      }
+    },
+  };
+}
+
+const browserTaskQueue = createBrowserTaskQueue();
 
 function json(response, status, value, origin = "") {
   response.writeHead(status, {
@@ -72,7 +118,8 @@ function tistoryUrl(value) {
     const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
     const isTistoryHost = url.hostname === "tistory.com"
       || url.hostname === "www.tistory.com"
-      || url.hostname.endsWith(".tistory.com");
+      || url.hostname.endsWith(".tistory.com")
+      || TISTORY_CUSTOM_HOSTS.has(url.hostname);
     return url.protocol === "https:" && isTistoryHost ? url : null;
   } catch {
     return null;
@@ -119,6 +166,38 @@ async function readBody(request) {
 async function getContext() {
   if (browserContext) return browserContext;
 
+  if (embeddedBrowserEndpoint) {
+    const deadline = Date.now() + 10_000;
+    let lastError;
+    while (Date.now() < deadline) {
+      try {
+        browserConnection = await chromium.connectOverCDP(embeddedBrowserEndpoint);
+        break;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+    if (!browserConnection) {
+      throw lastError ?? new Error("Electron 자동화 브라우저에 연결하지 못했습니다.");
+    }
+
+    const contexts = browserConnection.contexts();
+    browserContext = contexts[0];
+    workPage = contexts
+      .flatMap((context) => context.pages())
+      .find((page) => page.url() === embeddedAutomationPageUrl);
+    if (!browserContext || !workPage) {
+      throw new Error("Electron 자동화 브라우저 화면을 찾지 못했습니다.");
+    }
+    browserConnection.on("disconnected", () => {
+      browserConnection = undefined;
+      browserContext = undefined;
+      workPage = undefined;
+    });
+    return browserContext;
+  }
+
   browserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
     channel: process.env.PLAYWRIGHT_CHANNEL ?? "chrome",
     headless: false,
@@ -132,16 +211,30 @@ async function getContext() {
 
 async function getWorkPage() {
   const context = await getContext();
+  if (workPage && !workPage.isClosed()) {
+    workPage.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    return workPage;
+  }
   const pages = context.pages();
   const page = pages.find((candidate) => candidate.url() === "about:blank") ?? (await context.newPage());
-  page.setDefaultTimeout(5_000);
+  workPage = page;
+  page.setDefaultTimeout(ACTION_TIMEOUT_MS);
   return page;
 }
 
 // 사람이 직접 확인·작업해야 하는 순간(로그인·검토 대기·직접 처리 안내)에만 방송대 창을 앞으로 가져옵니다.
 // 자동 이동·채우기·제출 단계에서는 포커스를 뺏지 않아 사용자가 그동안 다른 작업을 계속할 수 있습니다.
 async function surfaceForUser(page) {
+  if (embeddedBrowserEndpoint) {
+    await showEmbeddedBrowser();
+    return;
+  }
   await page.bringToFront().catch(() => undefined);
+}
+
+async function prepareBrowserInBackground() {
+  if (!embeddedBrowserEndpoint) return;
+  await hideEmbeddedBrowser();
 }
 
 async function firstVisible(locators) {
@@ -279,7 +372,7 @@ async function acceptWriteAccessibilityNotice(page) {
   return false;
 }
 
-async function waitForPostForm(page, timeoutMs = 7_000) {
+async function waitForPostForm(page, timeoutMs = POST_FORM_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await acceptWriteAccessibilityNotice(page);
@@ -295,7 +388,7 @@ async function clickFormControl(page, createLocators) {
 
   await control.scrollIntoViewIfNeeded().catch(() => undefined);
   const popupPromise = page.waitForEvent("popup", { timeout: 1_500 }).catch(() => null);
-  await control.click({ timeout: 7_000 }).catch(async () => {
+  await control.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
     await control.evaluate((element) => {
       if (element instanceof HTMLElement) element.click();
     });
@@ -303,9 +396,8 @@ async function clickFormControl(page, createLocators) {
 
   const popup = await popupPromise;
   const targetPage = popup ?? page;
-  await targetPage.waitForLoadState("domcontentloaded", { timeout: 7_000 }).catch(() => undefined);
-  await waitForPostForm(targetPage);
-  return targetPage;
+  await targetPage.waitForLoadState("domcontentloaded", { timeout: NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
+  return (await waitForPostForm(targetPage)) ? targetPage : null;
 }
 
 export function openEditForm(page) {
@@ -398,6 +490,82 @@ async function fillHtml(page, html) {
   }
 
   return filledEditor;
+}
+
+function namoSourceLocators(scope) {
+  return [
+    scope.locator('textarea#NamoSE_editorhtml_editor'),
+    scope.locator('textarea[id$="_editorhtml_editor" i]'),
+    scope.locator('textarea.NamoSE_html_frame'),
+    scope.locator('textarea[title*="HTML 편집 모드"]'),
+  ];
+}
+
+function namoHtmlTabLocators(scope) {
+  return [
+    scope.locator('#NamoSE_editorhtml, [id$="_editorhtml" i]'),
+    scope.getByRole("tab", { name: /^HTML$/i }),
+    scope.getByRole("button", { name: /^HTML$/i }),
+    scope.getByRole("link", { name: /^HTML$/i }),
+    scope.locator("li, a, button, span").filter({ hasText: /^HTML$/i }),
+  ];
+}
+
+async function findVisibleNamoSource(page) {
+  for (const scope of searchScopes(page)) {
+    for (const locator of namoSourceLocators(scope)) {
+      if ((await locator.count().catch(() => 0)) === 0) continue;
+      const candidate = locator.first();
+      if (await candidate.isVisible().catch(() => false)) return candidate;
+    }
+  }
+  return null;
+}
+
+export async function activateNamoHtmlMode(page) {
+  if (await findVisibleNamoSource(page)) return true;
+
+  const htmlTab = await firstVisibleAcrossFrames(page, namoHtmlTabLocators);
+  if (!htmlTab) return false;
+
+  await htmlTab.scrollIntoViewIfNeeded().catch(() => undefined);
+  await htmlTab.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
+    await htmlTab.evaluate((element) => {
+      if (element instanceof HTMLElement) element.click();
+    });
+  });
+
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await findVisibleNamoSource(page)) return true;
+    await page.waitForTimeout(200);
+  }
+  return false;
+}
+
+export async function fillKnouHtml(page, html) {
+  const namoReady = await activateNamoHtmlMode(page);
+  if (!namoReady) return fillHtml(page, html);
+
+  const source = await findVisibleNamoSource(page);
+  if (!source) return false;
+
+  await source.fill(html);
+  await source.evaluate((element) => {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "End" }));
+    element.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+  });
+  return (await source.inputValue()) === html;
+}
+
+async function fillKnouPostForm(page, title, html) {
+  const [titleFilled, htmlFilled] = await Promise.all([
+    fillTitle(page, title.trim()),
+    fillKnouHtml(page, html),
+  ]);
+  return { titleFilled, htmlFilled };
 }
 
 async function selectTistoryCategory(page, category) {
@@ -516,29 +684,107 @@ async function tistoryEditorImageSources(page) {
   const sources = [];
   for (const scope of searchScopes(page)) {
     const values = await scope.locator("img[src]").evaluateAll((images) => (
-      images.map((image) => image.getAttribute("src") || "").filter(Boolean)
+      images.flatMap((image) => [
+        image.getAttribute("src"),
+        image.getAttribute("data-src"),
+        image.getAttribute("data-origin-src"),
+        image.closest("[data-url]")?.getAttribute("data-url"),
+      ]).filter(Boolean)
     )).catch(() => []);
     sources.push(...values);
   }
   return new Set(sources);
 }
 
-async function uploadTistoryImage(page, filePath) {
-  const before = await tistoryEditorImageSources(page);
-  const fileInput = await firstExistingAcrossFrames(page, (scope) => [
-    scope.locator('input[type="file"][accept*="image" i]'),
-    scope.locator('input[type="file"]'),
-  ]);
+async function resetTistoryImageFocus(page) {
+  await page.keyboard.press("Escape").catch(() => undefined);
 
-  if (fileInput) {
-    await fileInput.setInputFiles(filePath);
+  const editor = await firstVisibleAcrossFrames(page, (scope) => [
+    scope.locator('[contenteditable="true"][role="textbox"]'),
+    scope.locator(".ProseMirror, .toastui-editor-contents[contenteditable='true'], .cke_editable"),
+    scope.locator('body[contenteditable="true"]'),
+    scope.locator('[contenteditable="true"]'),
+  ]);
+  if (!editor) return;
+
+  await editor.evaluate((element) => {
+    element.querySelectorAll("[data-mce-selected]").forEach((selected) => {
+      selected.removeAttribute("data-mce-selected");
+    });
+
+    const selection = element.ownerDocument.defaultView?.getSelection();
+    if (!selection) return;
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (element instanceof HTMLElement) element.focus();
+  }).catch(() => undefined);
+  await page.waitForTimeout(100);
+}
+
+async function findTistoryImageFileInput(page) {
+  for (const scope of searchScopes(page)) {
+    const inputs = scope.locator('input[type="file"]');
+    const candidates = [];
+    const count = Math.min(await inputs.count().catch(() => 0), 20);
+
+    for (let index = 0; index < count; index += 1) {
+      const input = inputs.nth(index);
+      const details = await input.evaluate((element) => {
+        const marker = [
+          element.id,
+          element.getAttribute("name"),
+          element.getAttribute("class"),
+          element.getAttribute("aria-label"),
+          element.getAttribute("data-testid"),
+          element.parentElement?.getAttribute("class"),
+          element.parentElement?.parentElement?.getAttribute("class"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const contextual = Boolean(element.closest(
+          'figure, [data-ke-type="image"], [class*="image-toolbar" i], '
+          + '[class*="image_control" i], [class*="image-control" i], '
+          + '[class*="image-action" i]',
+        )) || /(replace|change|modify|교체|변경|수정)/i.test(marker);
+        const accept = String(element.getAttribute("accept") ?? "").toLowerCase();
+        const score = (accept.includes("image") ? 30 : 0)
+          + (element.hasAttribute("multiple") ? 20 : 0)
+          + (/(attach|upload|file|첨부|업로드)/i.test(marker) ? 10 : 0);
+        return {
+          contextual,
+          disabled: element.disabled,
+          score,
+        };
+      }).catch(() => null);
+      if (!details || details.contextual || details.disabled) continue;
+      candidates.push({ input, score: details.score });
+    }
+
+    candidates.sort((left, right) => right.score - left.score);
+    if (candidates.length > 0) return candidates[0].input;
+  }
+  return null;
+}
+
+async function uploadTistoryImages(page, filePaths) {
+  await resetTistoryImageFocus(page);
+  const before = await tistoryEditorImageSources(page);
+  const fileInput = await findTistoryImageFileInput(page);
+  const canUseFileInput = fileInput && (
+    filePaths.length === 1
+    || await fileInput.getAttribute("multiple").then((value) => value !== null).catch(() => false)
+  );
+
+  if (canUseFileInput) {
+    await fileInput.setInputFiles(filePaths);
   } else {
     const attachmentControl = await firstVisibleAcrossFrames(page, (scope) => [
       scope.getByRole("button", { name: /^첨부$/ }),
       scope.locator('[role="button"][aria-label="첨부"]'),
       scope.locator("#attach-layer-btn"),
     ]);
-    if (!attachmentControl) return "";
+    if (!attachmentControl) return [];
     await attachmentControl.click();
 
     const imageMenuItem = await firstVisibleAcrossFrames(page, (scope) => [
@@ -546,39 +792,63 @@ async function uploadTistoryImage(page, filePath) {
       scope.getByRole("menuitem", { name: /^사진$/ }),
       scope.getByText(/^사진$/, { exact: true }),
     ]);
-    if (!imageMenuItem) return "";
+    if (!imageMenuItem) return [];
 
     const chooserPromise = page.waitForEvent("filechooser", { timeout: 5_000 }).catch(() => null);
     await imageMenuItem.click();
     const chooser = await chooserPromise;
-    if (!chooser) return "";
-    await chooser.setFiles(filePath);
+    if (!chooser || (filePaths.length > 1 && !chooser.isMultiple())) return [];
+    await chooser.setFiles(filePaths);
   }
 
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + Math.min(60_000, 20_000 + (filePaths.length * 5_000));
+  let latestUploads = [];
   while (Date.now() < deadline) {
     await page.waitForTimeout(350);
     for (const scope of searchScopes(page)) {
       const uploaded = await scope.locator("img[src]").evaluateAll((images, previousSources) => {
         const previous = new Set(previousSources);
-        const image = images.find((candidate) => {
-          const source = candidate.getAttribute("src") || "";
-          return source
-            && !previous.has(source)
-            && !source.startsWith("data:")
-            && !source.startsWith("blob:");
-        });
-        if (!image) return null;
-        const figure = image.closest("figure");
-        return {
-          url: image.getAttribute("src") || "",
-          figureHtml: (figure || image).outerHTML,
-        };
+        const results = [];
+        const seen = new Set();
+
+        for (const image of images) {
+          const candidates = [
+            image.getAttribute("src"),
+            image.getAttribute("data-src"),
+            image.getAttribute("data-origin-src"),
+            image.closest("[data-url]")?.getAttribute("data-url"),
+          ].filter(Boolean);
+          const url = candidates.find((candidate) => (
+            !previous.has(candidate)
+            && !candidate.startsWith("data:")
+            && !candidate.startsWith("blob:")
+            && !candidate.startsWith("growthlog-asset:")
+          ));
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+
+          const originalFigure = image.closest("figure");
+          const clonedRoot = (originalFigure || image).cloneNode(true);
+          const clonedImage = clonedRoot instanceof HTMLImageElement
+            ? clonedRoot
+            : clonedRoot.querySelector("img");
+          if (clonedImage) clonedImage.setAttribute("src", url);
+          results.push({
+            url,
+            figureHtml: clonedRoot.outerHTML,
+          });
+        }
+        return results;
       }, [...before]).catch(() => null);
-      if (uploaded?.url) return uploaded;
+      if (Array.isArray(uploaded) && uploaded.length > latestUploads.length) latestUploads = uploaded;
+      if (latestUploads.length >= filePaths.length) {
+        await resetTistoryImageFocus(page);
+        return latestUploads.slice(0, filePaths.length);
+      }
     }
   }
-  return null;
+  await resetTistoryImageFocus(page);
+  return latestUploads;
 }
 
 function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
@@ -605,7 +875,7 @@ function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
   return html.replace(figurePattern, figureHtml);
 }
 
-async function uploadTistoryAttachments(page, html, attachments) {
+export async function uploadTistoryAttachments(page, html, attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0) return { ok: true, html };
   if (attachments.length > 30) {
     return { ok: false, code: "TOO_MANY_IMAGES", message: "글 하나에는 이미지 30개까지 올릴 수 있습니다." };
@@ -614,6 +884,7 @@ async function uploadTistoryAttachments(page, html, attachments) {
   const tempDirectory = await fs.promises.mkdtemp(path.join(process.env.TMPDIR || "/tmp", "growth-log-tistory-"));
   let finalHtml = html;
   try {
+    const prepared = [];
     for (let index = 0; index < attachments.length; index += 1) {
       const attachment = attachments[index];
       const id = String(attachment?.id ?? "").trim();
@@ -628,15 +899,21 @@ async function uploadTistoryAttachments(page, html, attachments) {
 
       const filePath = path.join(tempDirectory, `${String(index + 1).padStart(2, "0")}${imageExtension(decoded.mimeType)}`);
       await fs.promises.writeFile(filePath, decoded.buffer, { mode: 0o600 });
-      const uploaded = await uploadTistoryImage(page, filePath);
-      if (!uploaded) {
-        return {
-          ok: false,
-          code: "TISTORY_IMAGE_UPLOAD_FAILED",
-          message: `'${String(attachment.name || `${index + 1}번째 이미지`)}' 업로드 결과를 확인하지 못했습니다.`,
-        };
-      }
-      finalHtml = replaceTistoryImagePlaceholder(finalHtml, id, uploaded);
+      prepared.push({ attachment, id, filePath });
+    }
+
+    const uploaded = await uploadTistoryImages(page, prepared.map((item) => item.filePath));
+    if (uploaded.length !== prepared.length) {
+      const next = prepared[uploaded.length];
+      return {
+        ok: false,
+        code: "TISTORY_IMAGE_UPLOAD_FAILED",
+        message: `'${String(next?.attachment?.name || "이미지")}'을 포함한 업로드 결과를 모두 확인하지 못했습니다. (${uploaded.length}/${prepared.length})`,
+      };
+    }
+
+    for (let index = 0; index < prepared.length; index += 1) {
+      finalHtml = replaceTistoryImagePlaceholder(finalHtml, prepared[index].id, uploaded[index]);
     }
   } finally {
     await fs.promises.rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -797,7 +1074,7 @@ export async function submitPostForm(page, mode) {
     return {
       ok: false,
       code: "CAPTCHA_REQUIRED",
-      message: "방송대에서 CAPTCHA 확인이 필요합니다. 전용 Chrome에서 직접 완료한 뒤 다시 시도해 주세요.",
+      message: "방송대에서 CAPTCHA 확인이 필요합니다. 자동화 브라우저에서 직접 완료한 뒤 다시 시도해 주세요.",
     };
   }
 
@@ -812,16 +1089,27 @@ export async function submitPostForm(page, mode) {
     };
   }
 
+  const initialUrl = page.url();
   let dialogMessage = "";
+  let resolveSuccessDialog;
+  const successDialog = new Promise((resolve) => {
+    resolveSuccessDialog = resolve;
+  });
+  const navigation = page.waitForURL((url) => url.href !== initialUrl, {
+    timeout: NAVIGATION_TIMEOUT_MS,
+  }).then(() => true).catch(() => false);
   const acceptDialog = async (dialog) => {
     dialogMessage = dialog.message();
+    const success = dialog.type() === "alert"
+      && POST_COMPLETION_PATTERN.test(dialogMessage);
     await dialog.accept();
+    if (success) resolveSuccessDialog(true);
   };
   page.on("dialog", acceptDialog);
 
   try {
     await submitControl.scrollIntoViewIfNeeded().catch(() => undefined);
-    await submitControl.click({ timeout: 7_000 }).catch(async () => {
+    await submitControl.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
       await submitControl.evaluate((element) => {
         if (element instanceof HTMLElement) element.click();
       });
@@ -832,8 +1120,21 @@ export async function submitPostForm(page, mode) {
     ]);
     if (confirmControl) await confirmControl.click();
 
-    await page.waitForLoadState("domcontentloaded", { timeout: 7_000 }).catch(() => undefined);
-    await page.waitForTimeout(800);
+    const completionText = page.waitForFunction((patternSource) => {
+      const text = document.body?.innerText ?? "";
+      return new RegExp(patternSource).test(text);
+    }, POST_COMPLETION_PATTERN.source, {
+      timeout: NAVIGATION_TIMEOUT_MS,
+    }).then(() => true).catch(() => false);
+    const confirmed = await Promise.race([navigation, completionText, successDialog]);
+    if (!confirmed) {
+      return {
+        ok: false,
+        code: "SUBMIT_NOT_CONFIRMED",
+        message: "최종 버튼을 눌렀지만 방송대의 게시 완료를 확인하지 못했습니다. 열린 브라우저에서 상태를 확인해 주세요.",
+      };
+    }
+    await page.waitForTimeout(500);
   } finally {
     page.off("dialog", acceptDialog);
   }
@@ -1022,7 +1323,7 @@ async function openLogin() {
   return {
     ok: true,
     status: "login-opened",
-    message: "전용 Chrome 창을 열었습니다. 방송대 로그인을 완료한 뒤 이 창은 그대로 두세요.",
+    message: "Electron 자동화 브라우저를 열었습니다. 방송대 로그인을 완료한 뒤 창을 닫아도 됩니다.",
   };
 }
 
@@ -1078,6 +1379,7 @@ async function prepareTistoryDraft(body) {
     };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(manageUrl, { waitUntil: "domcontentloaded" });
   if (isTistoryLoginPage(page)) {
@@ -1087,7 +1389,7 @@ async function prepareTistoryDraft(body) {
       body: {
         ok: false,
         code: "TISTORY_LOGIN_REQUIRED",
-        message: "티스토리 로그인이 필요합니다. 열린 전용 Chrome에서 로그인한 뒤 다시 실행해 주세요.",
+        message: "티스토리 로그인이 필요합니다. 열린 자동화 브라우저에서 로그인한 뒤 다시 실행해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1101,7 +1403,7 @@ async function prepareTistoryDraft(body) {
       body: {
         ok: false,
         code: "TISTORY_EDITOR_NOT_FOUND",
-        message: "티스토리 글쓰기 화면을 찾지 못했습니다. 열린 Chrome에서 상태를 확인해 주세요.",
+        message: "티스토리 글쓰기 화면을 찾지 못했습니다. 열린 자동화 브라우저에서 상태를 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1198,6 +1500,7 @@ async function prepareTistoryModification(body) {
   if (!input.ok) return { status: 400, body: input };
 
   const postUrl = tistoryUrl(body.postUrl);
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(postUrl.href, { waitUntil: "domcontentloaded" });
   if (isTistoryLoginPage(page)) {
@@ -1207,7 +1510,7 @@ async function prepareTistoryModification(body) {
       body: {
         ok: false,
         code: "TISTORY_LOGIN_REQUIRED",
-        message: "티스토리 로그인이 필요합니다. 열린 전용 Chrome에서 로그인한 뒤 다시 실행해 주세요.",
+        message: "티스토리 로그인이 필요합니다. 열린 자동화 브라우저에서 로그인한 뒤 다시 실행해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1313,34 +1616,37 @@ async function prepareModification(body) {
     return { status: 400, body: { ok: false, code: "INVALID_HTML", message: "게시할 HTML 내용을 입력해 주세요." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
-  await page.goto(postUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
+    await surfaceForUser(page);
     return {
       status: 409,
       body: {
         ok: false,
         code: "LOGIN_REQUIRED",
-        message: "방송대 로그인이 필요합니다. 도우미의 로그인 창에서 로그인한 뒤 다시 시도해 주세요.",
+        message: "방송대 로그인이 필요합니다. 자동화 브라우저에서 로그인한 뒤 다시 시도해 주세요.",
       },
     };
   }
 
   const editPage = await openEditForm(page);
   if (!editPage) {
+    await surfaceForUser(page);
     return {
       status: 422,
       body: {
         ok: false,
         code: "EDIT_CONTROL_NOT_FOUND",
-        message: "수정 버튼을 찾지 못했습니다. 전용 Chrome에서 로그인 상태와 수정 권한을 확인해 주세요.",
+        message: "수정 버튼을 찾지 못했습니다. 자동화 브라우저에서 로그인 상태와 수정 권한을 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
   }
 
-  const [titleFilled, htmlFilled] = await Promise.all([fillTitle(editPage, title.trim()), fillHtml(editPage, html)]);
+  const { titleFilled, htmlFilled } = await fillKnouPostForm(editPage, title, html);
 
   if (!titleFilled || !htmlFilled) {
     await surfaceForUser(editPage);
@@ -1358,6 +1664,7 @@ async function prepareModification(body) {
   if (confirmFinalSubmit === true) {
     const submitted = await submitPostForm(editPage, "modify");
     if (!submitted.ok) {
+      await surfaceForUser(editPage);
       return {
         status: 422,
         body: {
@@ -1400,6 +1707,7 @@ async function autoLogin(body) {
     return { status: 400, body: { ok: false, code: "INVALID_PASSWORD", message: "비밀번호를 입력해 주세요." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
@@ -1409,7 +1717,7 @@ async function autoLogin(body) {
     await surfaceForUser(page);
     return {
       status: 422,
-      body: { ok: false, code: "LOGIN_FORM_NOT_FOUND", message: "로그인 입력란을 찾지 못했습니다. 전용 Chrome에서 직접 로그인해 주세요." },
+      body: { ok: false, code: "LOGIN_FORM_NOT_FOUND", message: "로그인 입력란을 찾지 못했습니다. 자동화 브라우저에서 직접 로그인해 주세요." },
     };
   }
 
@@ -1452,28 +1760,31 @@ async function prepareCreation(body) {
     return { status: 400, body: { ok: false, code: "INVALID_ROUND", message: "게시 회차는 1 이상의 정수여야 합니다." } };
   }
 
+  await prepareBrowserInBackground();
   const page = await getWorkPage();
-  await page.goto(boardUrl, { waitUntil: "domcontentloaded" });
+  await page.goto(boardUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
 
   if (page.url().includes("/error.html") || /\/login(?:[/?#]|$)/i.test(page.url())) {
+    await surfaceForUser(page);
     return {
       status: 409,
       body: {
         ok: false,
         code: "LOGIN_REQUIRED",
-        message: "방송대 로그인이 필요합니다. 도우미의 로그인 창에서 로그인한 뒤 다시 시도해 주세요.",
+        message: "방송대 로그인이 필요합니다. 자동화 브라우저에서 로그인한 뒤 다시 시도해 주세요.",
       },
     };
   }
 
   const writePage = await openWriteForm(page);
   if (!writePage) {
+    await surfaceForUser(page);
     return {
       status: 422,
       body: {
         ok: false,
         code: "WRITE_CONTROL_NOT_FOUND",
-        message: "글쓰기 버튼을 찾지 못했습니다. 전용 Chrome에서 로그인 상태와 작성 권한을 확인해 주세요.",
+        message: "글쓰기 버튼을 찾지 못했습니다. 자동화 브라우저에서 로그인 상태와 작성 권한을 확인해 주세요.",
         pageUrl: page.url(),
       },
     };
@@ -1490,14 +1801,14 @@ async function prepareCreation(body) {
         body: {
           ok: false,
           code: "CATEGORY_NOT_MATCHED",
-          message: `지역 분류에서 '${category.region}'에 해당하는 항목을 찾지 못했습니다. 전용 Chrome에서 분류를 직접 선택한 뒤 다시 시도해 주세요.`,
+          message: `지역 분류에서 '${category.region}'에 해당하는 항목을 찾지 못했습니다. 자동화 브라우저에서 분류를 직접 선택한 뒤 다시 시도해 주세요.`,
           pageUrl: writePage.url(),
         },
       };
     }
   }
 
-  const [titleFilled, htmlFilled] = await Promise.all([fillTitle(writePage, title.trim()), fillHtml(writePage, html)]);
+  const { titleFilled, htmlFilled } = await fillKnouPostForm(writePage, title, html);
 
   if (!titleFilled || !htmlFilled) {
     await surfaceForUser(writePage);
@@ -1515,6 +1826,7 @@ async function prepareCreation(body) {
   if (confirmFinalSubmit === true) {
     const submitted = await submitPostForm(writePage, "create");
     if (!submitted.ok) {
+      await surfaceForUser(writePage);
       return {
         status: 422,
         body: {
@@ -1558,45 +1870,22 @@ async function prepareCreation(body) {
   };
 }
 
-const WEB_ASSETS = new Map([
-  ["/", "index.html"],
-  ["/index.html", "index.html"],
-  ["/app.js", "app.js"],
-  ["/styles.css", "styles.css"],
-]);
-
-function resolveWebAsset(relativePath) {
-  const candidates = [
-    path.join(helperDirectory, "web", relativePath),
-    path.join(helperDirectory, "..", "web", relativePath),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? "";
+async function respondWithBrowserTask(response, origin, task) {
+  const result = await browserTaskQueue.run(task);
+  const isHttpResult = result
+    && Number.isInteger(result.status)
+    && Object.prototype.hasOwnProperty.call(result, "body");
+  json(
+    response,
+    isHttpResult ? result.status : 200,
+    isHttpResult ? result.body : result,
+    origin,
+  );
 }
 
-function serveWebAsset(response, requestPath) {
-  const relativePath = WEB_ASSETS.get(requestPath);
-  const isZipLibrary = requestPath === "/vendor/jszip.min.js";
-  if (!relativePath && !isZipLibrary) return false;
-  const filePath = isZipLibrary
-    ? [
-      path.join(helperDirectory, "node_modules", "jszip", "dist", "jszip.min.js"),
-      path.join(helperDirectory, "..", "node_modules", "jszip", "dist", "jszip.min.js"),
-    ].find((candidate) => fs.existsSync(candidate))
-    : resolveWebAsset(relativePath);
-  if (!filePath) return false;
-
-  const contentType = requestPath.endsWith(".js")
-    ? "text/javascript; charset=utf-8"
-    : requestPath.endsWith(".css")
-      ? "text/css; charset=utf-8"
-      : "text/html; charset=utf-8";
-  response.writeHead(200, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-  });
-  fs.createReadStream(filePath).pipe(response);
-  return true;
+async function respondWithBodyBrowserTask(request, response, origin, task) {
+  const body = await readBody(request);
+  await respondWithBrowserTask(response, origin, () => task(body));
 }
 
 function createServer() {
@@ -1623,15 +1912,14 @@ function createServer() {
     }
 
     try {
-      const requestPath = new URL(request.url, `http://${HOST}`).pathname;
-      if (request.method === "GET" && serveWebAsset(response, requestPath)) return;
-
       if (request.method === "GET" && request.url === "/health") {
         json(response, 200, {
           ok: true,
           service: "growth-log-connector",
           message: authorized ? "연결 앱이 준비되었습니다." : "운영 프로그램 연결 승인이 필요합니다.",
-          browserOpen: Boolean(browserContext),
+          browserOpen: Boolean(browserContext || embeddedBrowserEndpoint),
+          browserMode: embeddedBrowserEndpoint ? "electron" : "chrome",
+          queuedBrowserTasks: browserTaskQueue.pending,
           authorized,
           safety: "confirmed-auto-final-submit",
         }, origin);
@@ -1648,67 +1936,65 @@ function createServer() {
       }
 
       if (request.method === "POST" && request.url === "/login") {
-        json(response, 200, await openLogin(), origin);
+        await respondWithBrowserTask(response, origin, openLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/login-auto") {
-        const result = await autoLogin(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, autoLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/login") {
-        json(response, 200, await openTistoryLogin(await readBody(request)), origin);
+        await respondWithBodyBrowserTask(request, response, origin, openTistoryLogin);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/draft") {
-        const result = await prepareTistoryDraft(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryDraft);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/drafts") {
-        const result = await prepareTistoryDraftBatch(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryDraftBatch);
         return;
       }
 
       if (request.method === "POST" && request.url === "/tistory/modify") {
-        const result = await prepareTistoryModification(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareTistoryModification);
         return;
       }
 
       if (request.method === "POST" && request.url === "/modify") {
-        const result = await prepareModification(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareModification);
         return;
       }
 
       if (request.method === "POST" && request.url === "/create") {
-        const result = await prepareCreation(await readBody(request));
-        json(response, result.status, result.body, origin);
+        await respondWithBodyBrowserTask(request, response, origin, prepareCreation);
         return;
       }
 
-      json(response, 404, { ok: false, message: "요청한 도우미 경로를 찾을 수 없습니다." }, origin);
+      json(response, 404, { ok: false, message: "요청한 자동화 서비스 경로를 찾을 수 없습니다." }, origin);
     } catch (error) {
       const message = error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.";
       json(response, 500, {
         ok: false,
-        code: "HELPER_ERROR",
-        message: `로컬 도우미 오류: ${message}`,
+        code: "AUTOMATION_ERROR",
+        message: `브라우저 자동화 오류: ${message}`,
       }, origin);
     }
   });
 }
 
-export async function startKnouHelper({
+export async function startBrowserAutomation({
   host = "127.0.0.1",
-  port = Number(process.env.KNOU_HELPER_PORT ?? 4317),
-  profileDir = path.resolve(process.env.KNOU_PROFILE_DIR ?? ".knou-playwright-profile"),
+  port = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317),
+  profileDir = path.resolve(process.env.BROWSER_AUTOMATION_PROFILE_DIR ?? ".browser-automation-profile"),
+  browserEndpoint = "",
+  automationPageUrl = "",
+  showAutomationWindow = async () => undefined,
+  hideAutomationWindow = async () => undefined,
   extraAllowedOrigins = [],
   isPairedOrigin = () => false,
   quiet = false,
@@ -1718,11 +2004,17 @@ export async function startKnouHelper({
   HOST = host;
   PORT = port;
   PROFILE_DIR = path.resolve(profileDir);
+  embeddedBrowserEndpoint = String(browserEndpoint ?? "").trim();
+  embeddedAutomationPageUrl = String(automationPageUrl ?? "").trim();
+  showEmbeddedBrowser = showAutomationWindow;
+  hideEmbeddedBrowser = hideAutomationWindow;
   authorizePairedOrigin = isPairedOrigin;
   allowedOrigins = new Set([
     ...allowedOrigins,
     ...extraAllowedOrigins.map((origin) => origin.trim()).filter(Boolean),
   ]);
+
+  if (embeddedBrowserEndpoint) await getContext();
 
   const server = createServer();
   await new Promise((resolve, reject) => {
@@ -1737,7 +2029,9 @@ export async function startKnouHelper({
 
   if (!quiet) {
     console.log(`Growth Log connector: http://${HOST}:${actualPort}`);
-    console.log(`Dedicated Chrome profile: ${PROFILE_DIR}`);
+    console.log(embeddedBrowserEndpoint
+      ? "Automation browser: Electron"
+      : `Automation browser profile: ${PROFILE_DIR}`);
     console.log("Keep this process open. Final submit runs only after an explicit confirmed request.");
   }
 
@@ -1746,11 +2040,14 @@ export async function startKnouHelper({
     port: actualPort,
     openLogin,
     openTistoryLogin,
-    dashboardUrl: `http://${HOST}:${actualPort}/`,
     async close() {
       await new Promise((resolve) => server.close(resolve));
-      await browserContext?.close().catch(() => undefined);
+      if (!embeddedBrowserEndpoint) {
+        await browserContext?.close().catch(() => undefined);
+      }
+      browserConnection = undefined;
       browserContext = undefined;
+      workPage = undefined;
       activeServer = undefined;
     },
   };
@@ -1761,9 +2058,9 @@ const isDirectExecution = process.argv[1]
   && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
 if (isDirectExecution) {
-  const helper = await startKnouHelper();
+  const automation = await startBrowserAutomation();
   const shutdown = async () => {
-    await helper.close();
+    await automation.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

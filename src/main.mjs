@@ -1,18 +1,37 @@
-import { app, BrowserWindow, Menu, Tray, dialog, nativeImage, shell } from "electron";
+import { app, BrowserWindow, Menu, Tray, dialog, nativeImage } from "electron";
 import { readFile, writeFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const PROTOCOL = "growthlog-connector";
+const AUTOMATION_PAGE_URL = "about:blank#growth-log-automation";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const pairings = new Map();
 
 let connector;
 let tray;
 let statusWindow;
+let automationWindow;
 let pendingDeepLink = "";
 let isQuitting = false;
+
+async function reserveLoopbackPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve(port);
+      });
+    });
+  });
+}
 
 function pairingFilePath() {
   return path.join(app.getPath("userData"), "paired-sites.json");
@@ -127,28 +146,82 @@ function showStatusWindow() {
   });
 }
 
+async function createAutomationWindow() {
+  const automationWebPreferences = {
+    partition: "persist:growth-log-automation",
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    backgroundThrottling: false,
+  };
+  automationWindow = new BrowserWindow({
+    width: 1280,
+    height: 900,
+    minWidth: 900,
+    minHeight: 650,
+    show: false,
+    title: "Growth Log 자동화 브라우저",
+    webPreferences: automationWebPreferences,
+  });
+  automationWindow.removeMenu();
+  automationWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const target = new URL(url);
+      const allowed = target.protocol === "https:" && (
+        target.hostname === "knou.ac.kr"
+        || target.hostname.endsWith(".knou.ac.kr")
+        || target.hostname === "tistory.com"
+        || target.hostname.endsWith(".tistory.com")
+        || target.hostname === "kakao.com"
+        || target.hostname.endsWith(".kakao.com")
+        || target.hostname === "blog.growthlog.org"
+      );
+      if (!allowed) return { action: "deny" };
+    } catch {
+      return { action: "deny" };
+    }
+    return {
+      action: "allow",
+      overrideBrowserWindowOptions: {
+        parent: automationWindow,
+        webPreferences: automationWebPreferences,
+      },
+    };
+  });
+  automationWindow.webContents.on("did-create-window", (window) => {
+    window.removeMenu();
+  });
+  automationWindow.on("close", (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    automationWindow?.hide();
+  });
+  automationWindow.on("closed", () => {
+    automationWindow = undefined;
+  });
+  await automationWindow.loadURL(AUTOMATION_PAGE_URL);
+  return automationWindow;
+}
+
+function showAutomationWindow() {
+  if (!automationWindow || automationWindow.isDestroyed()) return;
+  automationWindow.show();
+  automationWindow.focus();
+}
+
+function hideAutomationWindow() {
+  if (!automationWindow || automationWindow.isDestroyed()) return;
+  automationWindow.hide();
+}
+
 async function openAutomationLogin() {
   try {
     await connector?.openLogin();
   } catch (error) {
     await dialog.showMessageBox({
       type: "error",
-      title: "Chrome 실행 오류",
-      message: "방송대 로그인 창을 열지 못했습니다.",
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-async function openTistoryDashboard() {
-  const url = connector?.dashboardUrl ?? "http://127.0.0.1:4317/";
-  try {
-    await shell.openExternal(url);
-  } catch (error) {
-    await dialog.showMessageBox({
-      type: "error",
-      title: "자동화 화면 열기 오류",
-      message: "티스토리 임시저장 화면을 열지 못했습니다.",
+      title: "자동화 브라우저 오류",
+      message: "방송대 로그인 화면을 열지 못했습니다.",
       detail: error instanceof Error ? error.message : String(error),
     });
   }
@@ -156,8 +229,8 @@ async function openTistoryDashboard() {
 
 function rebuildTrayMenu() {
   tray?.setContextMenu(Menu.buildFromTemplate([
-    { label: "티스토리 임시저장 열기", click: () => void openTistoryDashboard() },
     { label: "연결 상태 보기", click: showStatusWindow },
+    { label: "자동화 브라우저 보기", click: showAutomationWindow },
     { label: "방송대 로그인 창 열기", click: () => void openAutomationLogin() },
     { type: "separator" },
     {
@@ -189,10 +262,7 @@ function rebuildTrayMenu() {
     { type: "separator" },
     {
       label: "종료",
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      },
+      click: () => app.quit(),
     },
   ]));
 }
@@ -212,10 +282,14 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
+  const electronDebugPort = await reserveLoopbackPort();
+  app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
+  app.commandLine.appendSwitch("remote-debugging-port", String(electronDebugPort));
+
   app.on("second-instance", (_event, args) => {
     const deepLink = findDeepLink(args);
     if (deepLink) void handleDeepLink(deepLink);
-    else void openTistoryDashboard();
+    else showStatusWindow();
   });
 
   app.on("open-url", (event, url) => {
@@ -223,9 +297,10 @@ if (!gotSingleInstanceLock) {
     void handleDeepLink(url);
   });
 
-  if (process.defaultApp && process.argv[1]) {
-    app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
-  } else {
+  // 개발용 Electron 실행 파일을 URL handler로 등록하면 macOS가 앱 경로 없이
+  // Electron만 다시 실행해 기본 시작 화면을 띄운다. 배포된 앱의 Info.plist가
+  // protocol을 등록하므로, 실제 패키지 앱에서만 기본 handler로 설정한다.
+  if (!process.defaultApp) {
     app.setAsDefaultProtocolClient(PROTOCOL);
   }
 
@@ -233,9 +308,13 @@ if (!gotSingleInstanceLock) {
     await loadPairings();
     let connectorStartError;
     try {
-      const { startKnouHelper } = await import("../generated/knou-helper.mjs");
-      connector = await startKnouHelper({
-        profileDir: path.join(app.getPath("userData"), "knou-playwright-profile"),
+      await createAutomationWindow();
+      const { startBrowserAutomation } = await import("../generated/browser-automation.mjs");
+      connector = await startBrowserAutomation({
+        browserEndpoint: `http://127.0.0.1:${electronDebugPort}`,
+        automationPageUrl: AUTOMATION_PAGE_URL,
+        showAutomationWindow,
+        hideAutomationWindow,
         isPairedOrigin: (origin, token) => pairings.get(origin) === token,
         quiet: true,
       });
@@ -256,17 +335,24 @@ if (!gotSingleInstanceLock) {
 
     const initialDeepLink = pendingDeepLink || findDeepLink(process.argv);
     if (initialDeepLink) void handleDeepLink(initialDeepLink);
-    else void openTistoryDashboard();
+    else showStatusWindow();
 
     app.on("activate", showStatusWindow);
     app.on("window-all-closed", () => {
       // Keep the connector available in the tray.
     });
     app.on("before-quit", (event) => {
-      if (isQuitting || !connector) return;
+      if (isQuitting) return;
+      if (!connector) {
+        isQuitting = true;
+        return;
+      }
       event.preventDefault();
       isQuitting = true;
-      void connector.close().finally(() => app.quit());
+      void connector.close().finally(() => {
+        automationWindow?.destroy();
+        app.quit();
+      });
     });
   }).catch(async (error) => {
     console.error("Growth Log connector app failed to initialize:", error);

@@ -224,9 +224,9 @@ async function getWorkPage() {
 
 // 사람이 직접 확인·작업해야 하는 순간(로그인·검토 대기·직접 처리 안내)에만 방송대 창을 앞으로 가져옵니다.
 // 자동 이동·채우기·제출 단계에서는 포커스를 뺏지 않아 사용자가 그동안 다른 작업을 계속할 수 있습니다.
-async function surfaceForUser(page) {
+async function surfaceForUser(page, force = false) {
   if (embeddedBrowserEndpoint) {
-    await showEmbeddedBrowser();
+    await showEmbeddedBrowser(force);
     return;
   }
   await page.bringToFront().catch(() => undefined);
@@ -1319,7 +1319,7 @@ async function recordRoundCreation({ boardId, title, postUrl, round }) {
 async function openLogin() {
   const page = await getWorkPage();
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
-  await surfaceForUser(page);
+  await surfaceForUser(page, true);
   return {
     ok: true,
     status: "login-opened",
@@ -1332,7 +1332,7 @@ async function openTistoryLogin(body = {}) {
   const targetUrl = manageUrl || TISTORY_LOGIN_URL;
   const page = await getWorkPage();
   await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-  await surfaceForUser(page);
+  await surfaceForUser(page, true);
   return {
     ok: true,
     status: "tistory-login-opened",

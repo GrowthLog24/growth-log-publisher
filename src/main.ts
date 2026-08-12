@@ -1,25 +1,29 @@
 import { app, BrowserWindow, Menu, Tray, dialog, nativeImage } from "electron";
+import type { MenuItem } from "electron";
 import { readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import type { startBrowserAutomation } from "./browser-automation.js";
+
+type Connector = Awaited<ReturnType<typeof startBrowserAutomation>>;
 
 const PROTOCOL = "growthlog-connector";
 const AUTOMATION_PAGE_URL = "about:blank#growth-log-automation";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
-const pairings = new Map();
+const pairings = new Map<string, string>();
 
-let connector;
-let tray;
-let statusWindow;
-let automationWindow;
-let automationPopupWindow;
+let connector: Connector | undefined;
+let tray: Tray | undefined;
+let statusWindow: BrowserWindow | undefined;
+let automationWindow: BrowserWindow | undefined;
+let automationPopupWindow: BrowserWindow | undefined;
 let pendingDeepLink = "";
 let isQuitting = false;
 let keepAutomationInBackground = false;
 
-async function reserveLoopbackPort() {
+async function reserveLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.unref();
@@ -35,11 +39,11 @@ async function reserveLoopbackPort() {
   });
 }
 
-function pairingFilePath() {
+function pairingFilePath(): string {
   return path.join(app.getPath("userData"), "paired-sites.json");
 }
 
-function isValidPairing(origin, token) {
+function isValidPairing(origin: string, token: string): boolean {
   try {
     const url = new URL(origin);
     const allowedProtocol = url.protocol === "https:"
@@ -50,7 +54,7 @@ function isValidPairing(origin, token) {
   }
 }
 
-async function loadPairings() {
+async function loadPairings(): Promise<void> {
   try {
     const entries = JSON.parse(await readFile(pairingFilePath(), "utf8"));
     if (!Array.isArray(entries)) return;
@@ -62,7 +66,7 @@ async function loadPairings() {
   }
 }
 
-async function savePairings() {
+async function savePairings(): Promise<void> {
   await writeFile(
     pairingFilePath(),
     JSON.stringify([...pairings.entries()], null, 2),
@@ -70,17 +74,17 @@ async function savePairings() {
   );
 }
 
-function findDeepLink(args) {
+function findDeepLink(args: string[]): string {
   return args.find((value) => value.startsWith(`${PROTOCOL}://`)) ?? "";
 }
 
-async function handleDeepLink(value) {
+async function handleDeepLink(value: string): Promise<void> {
   if (!value || !app.isReady()) {
     pendingDeepLink = value;
     return;
   }
 
-  let url;
+  let url: URL;
   try {
     url = new URL(value);
   } catch {
@@ -121,7 +125,7 @@ async function handleDeepLink(value) {
   });
 }
 
-function showStatusWindow() {
+function showStatusWindow(): void {
   if (statusWindow && !statusWindow.isDestroyed()) {
     statusWindow.show();
     statusWindow.focus();
@@ -148,7 +152,7 @@ function showStatusWindow() {
   });
 }
 
-async function createAutomationWindow() {
+async function createAutomationWindow(): Promise<BrowserWindow> {
   const automationWebPreferences = {
     partition: "persist:growth-log-automation",
     contextIsolation: true,
@@ -220,7 +224,7 @@ async function createAutomationWindow() {
   return automationWindow;
 }
 
-function showAutomationWindow(force = false) {
+function showAutomationWindow(force = false): void {
   const target = automationPopupWindow && !automationPopupWindow.isDestroyed()
     ? automationPopupWindow
     : automationWindow;
@@ -235,12 +239,12 @@ function showAutomationWindow(force = false) {
   target.showInactive();
 }
 
-function hideAutomationWindow() {
+function hideAutomationWindow(): void {
   if (automationWindow && !automationWindow.isDestroyed()) automationWindow.hide();
   if (automationPopupWindow && !automationPopupWindow.isDestroyed()) automationPopupWindow.hide();
 }
 
-async function openAutomationLogin() {
+async function openAutomationLogin(): Promise<void> {
   try {
     await connector?.openLogin();
   } catch (error) {
@@ -253,7 +257,7 @@ async function openAutomationLogin() {
   }
 }
 
-function rebuildTrayMenu() {
+function rebuildTrayMenu(): void {
   tray?.setContextMenu(Menu.buildFromTemplate([
     { label: "연결 상태 보기", click: showStatusWindow },
     { label: "자동화 브라우저 보기", click: () => showAutomationWindow(true) },
@@ -263,7 +267,7 @@ function rebuildTrayMenu() {
       label: "컴퓨터 시작 시 자동 실행",
       type: "checkbox",
       checked: app.getLoginItemSettings().openAtLogin,
-      click: (item) => {
+      click: (item: MenuItem) => {
         app.setLoginItemSettings({ openAtLogin: item.checked });
         rebuildTrayMenu();
       },
@@ -293,7 +297,7 @@ function rebuildTrayMenu() {
   ]));
 }
 
-function createTray() {
+function createTray(): void {
   const trayIcon = nativeImage.createFromDataURL(
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAQAAAC1+jfqAAAAMUlEQVR42mNgGAXUB8Q/gPgfEP8H4n8YxP8xDPz/GRgYGP4zMDAwMDCQkJBgFIwCAAAw9wUjS2XvGQAAAABJRU5ErkJggg==",
   );
@@ -332,10 +336,10 @@ if (!gotSingleInstanceLock) {
 
   void app.whenReady().then(async () => {
     await loadPairings();
-    let connectorStartError;
+    let connectorStartError: unknown;
     try {
       await createAutomationWindow();
-      const { startBrowserAutomation } = await import("../generated/browser-automation.mjs");
+      const { startBrowserAutomation } = await import("./browser-automation.js");
       connector = await startBrowserAutomation({
         browserEndpoint: `http://127.0.0.1:${electronDebugPort}`,
         automationPageUrl: AUTOMATION_PAGE_URL,

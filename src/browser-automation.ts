@@ -5,6 +5,39 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
+import type { Browser, BrowserContext, Dialog, Frame, Locator, Page } from "playwright-core";
+
+type Scope = Page | Frame;
+type LocatorFactory = (scope: Scope) => Locator[];
+type WindowToggle = (force?: boolean) => void | Promise<void>;
+
+interface FormResult {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  html?: string;
+  tags?: string[];
+  dialogMessage?: string;
+  attempted?: boolean;
+  region?: string;
+  status?: string;
+  pageUrl?: string;
+  skipped?: boolean;
+  [key: string]: unknown;
+}
+
+interface HttpResult {
+  status: number;
+  body: any;
+}
+
+interface ActiveServer {
+  host: string;
+  port: number;
+  openLogin: typeof openLogin;
+  openTistoryLogin: typeof openTistoryLogin;
+  close(): Promise<void>;
+}
 
 let HOST = "127.0.0.1";
 let PORT = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317);
@@ -19,7 +52,7 @@ const TISTORY_CUSTOM_HOSTS = new Set(
 );
 const MAX_BODY_BYTES = 80_000_000;
 
-function positiveNumber(value, fallback) {
+function positiveNumber(value: unknown, fallback: number): number {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
@@ -34,28 +67,28 @@ let allowedOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
-let authorizePairedOrigin = () => false;
+let authorizePairedOrigin: (origin: string, token: string) => boolean = () => false;
 
-let browserContext;
-let browserConnection;
-let workPage;
+let browserContext: BrowserContext | undefined;
+let browserConnection: Browser | undefined;
+let workPage: Page | undefined;
 let embeddedBrowserEndpoint = "";
 let embeddedAutomationPageUrl = "";
-let showEmbeddedBrowser = async () => undefined;
-let hideEmbeddedBrowser = async () => undefined;
-let activeServer;
+let showEmbeddedBrowser: WindowToggle = async () => undefined;
+let hideEmbeddedBrowser: WindowToggle = async () => undefined;
+let activeServer: ActiveServer | undefined;
 
 // 하나의 자동화 탭을 여러 요청이 동시에 조작하면 페이지 이동과 입력이 서로
 // 덮어씌워집니다. 모든 브라우저 작업은 이 큐를 통해 한 건씩 실행합니다.
 export function createBrowserTaskQueue() {
-  let tail = Promise.resolve();
+  let tail: Promise<unknown> = Promise.resolve();
   let pending = 0;
 
   return {
     get pending() {
       return pending;
     },
-    async run(task) {
+    async run<T>(task: () => T | Promise<T>): Promise<T> {
       pending += 1;
       const current = tail.then(() => task());
       tail = current.catch(() => undefined);
@@ -70,7 +103,7 @@ export function createBrowserTaskQueue() {
 
 const browserTaskQueue = createBrowserTaskQueue();
 
-function json(response, status, value, origin = "") {
+function json(response: http.ServerResponse, status: number, value: unknown, origin = ""): void {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
@@ -79,7 +112,7 @@ function json(response, status, value, origin = "") {
   response.end(JSON.stringify(value));
 }
 
-function isPotentialOrigin(origin) {
+function isPotentialOrigin(origin: string): boolean {
   if (!origin || allowedOrigins.has(origin)) return true;
 
   try {
@@ -91,7 +124,7 @@ function isPotentialOrigin(origin) {
   }
 }
 
-function isAuthorizedRequest(request, origin) {
+function isAuthorizedRequest(request: http.IncomingMessage, origin: string): boolean {
   if (!origin || allowedOrigins.has(origin)) return true;
   try {
     const url = new URL(origin);
@@ -103,16 +136,16 @@ function isAuthorizedRequest(request, origin) {
   return Boolean(token) && authorizePairedOrigin(origin, token);
 }
 
-function isKnouUrl(value) {
+function isKnouUrl(value: unknown): boolean {
   try {
-    const url = new URL(value);
+    const url = new URL(String(value));
     return url.protocol === "https:" && (url.hostname === "knou.ac.kr" || url.hostname.endsWith(".knou.ac.kr"));
   } catch {
     return false;
   }
 }
 
-function tistoryUrl(value) {
+function tistoryUrl(value: unknown): URL | null {
   try {
     const raw = String(value ?? "").trim();
     const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
@@ -126,18 +159,18 @@ function tistoryUrl(value) {
   }
 }
 
-export function normalizeTistoryManageUrl(value) {
+export function normalizeTistoryManageUrl(value: unknown): string {
   const url = tistoryUrl(value);
   if (!url || ["tistory.com", "www.tistory.com"].includes(url.hostname)) return "";
   return `${url.origin}/manage/newpost/?type=post&returnURL=%2Fmanage%2Fposts%2F`;
 }
 
-export function normalizeTistoryTags(value) {
+export function normalizeTistoryTags(value: unknown): string[] {
   const candidates = Array.isArray(value)
     ? value
     : String(value ?? "").split(/[\n,]+/);
-  const unique = [];
-  const seen = new Set();
+  const unique: string[] = [];
+  const seen = new Set<string>();
 
   for (const candidate of candidates) {
     const tag = String(candidate ?? "").trim().replace(/^#+/, "").trim();
@@ -149,8 +182,8 @@ export function normalizeTistoryTags(value) {
   return unique;
 }
 
-async function readBody(request) {
-  const chunks = [];
+async function readBody(request: http.IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
   let size = 0;
 
   for await (const chunk of request) {
@@ -163,12 +196,12 @@ async function readBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-async function getContext() {
+async function getContext(): Promise<BrowserContext> {
   if (browserContext) return browserContext;
 
   if (embeddedBrowserEndpoint) {
     const deadline = Date.now() + 10_000;
-    let lastError;
+    let lastError: unknown;
     while (Date.now() < deadline) {
       try {
         browserConnection = await chromium.connectOverCDP(embeddedBrowserEndpoint);
@@ -209,7 +242,7 @@ async function getContext() {
   return browserContext;
 }
 
-async function getWorkPage() {
+async function getWorkPage(): Promise<Page> {
   const context = await getContext();
   if (workPage && !workPage.isClosed()) {
     workPage.setDefaultTimeout(ACTION_TIMEOUT_MS);
@@ -224,7 +257,7 @@ async function getWorkPage() {
 
 // 사람이 직접 확인·작업해야 하는 순간(로그인·검토 대기·직접 처리 안내)에만 방송대 창을 앞으로 가져옵니다.
 // 자동 이동·채우기·제출 단계에서는 포커스를 뺏지 않아 사용자가 그동안 다른 작업을 계속할 수 있습니다.
-async function surfaceForUser(page, force = false) {
+async function surfaceForUser(page: Page, force = false): Promise<void> {
   if (embeddedBrowserEndpoint) {
     await showEmbeddedBrowser(force);
     return;
@@ -232,12 +265,12 @@ async function surfaceForUser(page, force = false) {
   await page.bringToFront().catch(() => undefined);
 }
 
-async function prepareBrowserInBackground() {
+async function prepareBrowserInBackground(): Promise<void> {
   if (!embeddedBrowserEndpoint) return;
   await hideEmbeddedBrowser();
 }
 
-async function firstVisible(locators) {
+async function firstVisible(locators: Locator[]): Promise<Locator | null> {
   for (const locator of locators) {
     const count = Math.min(await locator.count(), 12);
     for (let index = 0; index < count; index += 1) {
@@ -251,7 +284,7 @@ async function firstVisible(locators) {
   return null;
 }
 
-function searchScopes(page) {
+function searchScopes(page: Page): Scope[] {
   return [
     page,
     ...page.frames().filter((frame) => frame !== page.mainFrame()),
@@ -259,9 +292,9 @@ function searchScopes(page) {
 }
 
 // 페이지(또는 프레임)를 아래까지 단계적으로 스크롤해 지연 렌더링 요소를 노출시킨 뒤 맨 위로 돌아옵니다.
-async function revealByScrolling(scope) {
+async function revealByScrolling(scope: Scope): Promise<void> {
   await scope.evaluate(async () => {
-    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
     const doc = document.scrollingElement || document.documentElement;
     const step = Math.max(window.innerHeight * 0.8, 400);
     for (let y = 0; y <= doc.scrollHeight; y += step) {
@@ -272,7 +305,7 @@ async function revealByScrolling(scope) {
   }).catch(() => undefined);
 }
 
-async function firstVisibleAcrossFrames(page, createLocators) {
+async function firstVisibleAcrossFrames(page: Page, createLocators: LocatorFactory): Promise<Locator | null> {
   for (const scope of searchScopes(page)) {
     const candidate = await firstVisible(createLocators(scope)).catch(() => null);
     if (candidate) return candidate;
@@ -289,7 +322,7 @@ async function firstVisibleAcrossFrames(page, createLocators) {
   return null;
 }
 
-async function firstExistingAcrossFrames(page, createLocators) {
+async function firstExistingAcrossFrames(page: Page, createLocators: LocatorFactory): Promise<Locator | null> {
   for (const scope of searchScopes(page)) {
     for (const locator of createLocators(scope)) {
       if ((await locator.count().catch(() => 0)) > 0) return locator.first();
@@ -298,7 +331,7 @@ async function firstExistingAcrossFrames(page, createLocators) {
   return null;
 }
 
-function titleLocators(scope) {
+function titleLocators(scope: Scope): Locator[] {
   return [
     scope.locator("#post-title-inp"),
     scope.locator('textarea[placeholder*="제목"]'),
@@ -314,7 +347,7 @@ function titleLocators(scope) {
 const WRITE_ACCESSIBILITY_NOTICE =
   /장애인\s*웹\s*접근성\s*준수[\s\S]*이미지를\s*붙여넣기[\s\S]*저장되지\s*않습니다/;
 
-async function acceptWriteAccessibilityNotice(page) {
+async function acceptWriteAccessibilityNotice(page: Page): Promise<boolean> {
   for (const scope of searchScopes(page)) {
     const knouAffirmative = await firstVisible([
       scope.locator(
@@ -328,9 +361,9 @@ async function acceptWriteAccessibilityNotice(page) {
     ]).catch(() => null);
 
     if (knouAffirmative && knouNoticeText) {
-      await knouAffirmative.scrollIntoViewIfNeeded().catch(() => undefined);
+      await knouAffirmative.scrollIntoViewIfNeeded().catch((): void => undefined);
       await knouAffirmative.click({ timeout: 5_000 }).catch(async () => {
-        await knouAffirmative.evaluate((element) => {
+        await knouAffirmative.evaluate((element: HTMLElement | SVGElement) => {
           if (element instanceof HTMLElement) element.click();
         });
       });
@@ -360,9 +393,9 @@ async function acceptWriteAccessibilityNotice(page) {
 
     if (!affirmative) return false;
 
-    await affirmative.scrollIntoViewIfNeeded().catch(() => undefined);
+    await affirmative.scrollIntoViewIfNeeded().catch((): void => undefined);
     await affirmative.click({ timeout: 5_000 }).catch(async () => {
-      await affirmative.evaluate((element) => {
+      await affirmative.evaluate((element: HTMLElement | SVGElement) => {
         if (element instanceof HTMLElement) element.click();
       });
     });
@@ -372,7 +405,7 @@ async function acceptWriteAccessibilityNotice(page) {
   return false;
 }
 
-async function waitForPostForm(page, timeoutMs = POST_FORM_TIMEOUT_MS) {
+async function waitForPostForm(page: Page, timeoutMs = POST_FORM_TIMEOUT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await acceptWriteAccessibilityNotice(page);
@@ -382,25 +415,25 @@ async function waitForPostForm(page, timeoutMs = POST_FORM_TIMEOUT_MS) {
   return false;
 }
 
-async function clickFormControl(page, createLocators) {
+async function clickFormControl(page: Page, createLocators: LocatorFactory): Promise<Page | null> {
   const control = await firstVisibleAcrossFrames(page, createLocators);
   if (!control) return null;
 
   await control.scrollIntoViewIfNeeded().catch(() => undefined);
   const popupPromise = page.waitForEvent("popup", { timeout: 1_500 }).catch(() => null);
   await control.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
-    await control.evaluate((element) => {
+    await control.evaluate((element: HTMLElement | SVGElement) => {
       if (element instanceof HTMLElement) element.click();
     });
   });
 
   const popup = await popupPromise;
   const targetPage = popup ?? page;
-  await targetPage.waitForLoadState("domcontentloaded", { timeout: NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
+  await targetPage.waitForLoadState("domcontentloaded", { timeout: NAVIGATION_TIMEOUT_MS }).catch((): void => undefined);
   return (await waitForPostForm(targetPage)) ? targetPage : null;
 }
 
-export function openEditForm(page) {
+export function openEditForm(page: Page): Promise<Page | null> {
   return clickFormControl(page, (scope) => [
     scope.getByRole("link", { name: /^(게시글\s*)?(글\s*)?(수정|편집)$/ }),
     scope.getByRole("button", { name: /^(게시글\s*)?(글\s*)?(수정|편집)$/ }),
@@ -416,7 +449,7 @@ export function openEditForm(page) {
   ]);
 }
 
-export function openWriteForm(page) {
+export function openWriteForm(page: Page): Promise<Page | null> {
   return clickFormControl(page, (scope) => [
     scope.getByRole("link", { name: /^(새\s*글(\s*쓰기)?|글\s*쓰기|게시글\s*(쓰기|작성)|글\s*작성|작성)$/ }),
     scope.getByRole("button", { name: /^(새\s*글(\s*쓰기)?|글\s*쓰기|게시글\s*(쓰기|작성)|글\s*작성|작성)$/ }),
@@ -434,7 +467,7 @@ export function openWriteForm(page) {
   ]);
 }
 
-async function fillTitle(page, title) {
+async function fillTitle(page: Page, title: string): Promise<boolean> {
   const titleField = await firstVisibleAcrossFrames(page, titleLocators);
 
   if (!titleField) return false;
@@ -442,7 +475,7 @@ async function fillTitle(page, title) {
   return true;
 }
 
-async function assignHtml(locator, html) {
+async function assignHtml(locator: Locator, html: string): Promise<void> {
   await locator.evaluate((element, nextHtml) => {
     if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
       element.value = nextHtml;
@@ -454,7 +487,7 @@ async function assignHtml(locator, html) {
   }, html);
 }
 
-async function fillHtml(page, html) {
+async function fillHtml(page: Page, html: string): Promise<boolean> {
   let filledEditor = false;
 
   const pageEditor = await firstVisibleAcrossFrames(page, (scope) => [
@@ -492,7 +525,7 @@ async function fillHtml(page, html) {
   return filledEditor;
 }
 
-function namoSourceLocators(scope) {
+function namoSourceLocators(scope: Scope): Locator[] {
   return [
     scope.locator('textarea#NamoSE_editorhtml_editor'),
     scope.locator('textarea[id$="_editorhtml_editor" i]'),
@@ -501,7 +534,7 @@ function namoSourceLocators(scope) {
   ];
 }
 
-function namoHtmlTabLocators(scope) {
+function namoHtmlTabLocators(scope: Scope): Locator[] {
   return [
     scope.locator('#NamoSE_editorhtml, [id$="_editorhtml" i]'),
     scope.getByRole("tab", { name: /^HTML$/i }),
@@ -511,7 +544,7 @@ function namoHtmlTabLocators(scope) {
   ];
 }
 
-async function findVisibleNamoSource(page) {
+async function findVisibleNamoSource(page: Page): Promise<Locator | null> {
   for (const scope of searchScopes(page)) {
     for (const locator of namoSourceLocators(scope)) {
       if ((await locator.count().catch(() => 0)) === 0) continue;
@@ -522,7 +555,7 @@ async function findVisibleNamoSource(page) {
   return null;
 }
 
-export async function activateNamoHtmlMode(page) {
+export async function activateNamoHtmlMode(page: Page): Promise<boolean> {
   if (await findVisibleNamoSource(page)) return true;
 
   const htmlTab = await firstVisibleAcrossFrames(page, namoHtmlTabLocators);
@@ -530,7 +563,7 @@ export async function activateNamoHtmlMode(page) {
 
   await htmlTab.scrollIntoViewIfNeeded().catch(() => undefined);
   await htmlTab.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
-    await htmlTab.evaluate((element) => {
+    await htmlTab.evaluate((element: HTMLElement | SVGElement) => {
       if (element instanceof HTMLElement) element.click();
     });
   });
@@ -543,7 +576,7 @@ export async function activateNamoHtmlMode(page) {
   return false;
 }
 
-export async function fillKnouHtml(page, html) {
+export async function fillKnouHtml(page: Page, html: string): Promise<boolean> {
   const namoReady = await activateNamoHtmlMode(page);
   if (!namoReady) return fillHtml(page, html);
 
@@ -551,7 +584,7 @@ export async function fillKnouHtml(page, html) {
   if (!source) return false;
 
   await source.fill(html);
-  await source.evaluate((element) => {
+  await source.evaluate((element: HTMLElement | SVGElement) => {
     element.dispatchEvent(new Event("input", { bubbles: true }));
     element.dispatchEvent(new Event("change", { bubbles: true }));
     element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "End" }));
@@ -560,7 +593,7 @@ export async function fillKnouHtml(page, html) {
   return (await source.inputValue()) === html;
 }
 
-async function fillKnouPostForm(page, title, html) {
+async function fillKnouPostForm(page: Page, title: string, html: string): Promise<{ titleFilled: boolean; htmlFilled: boolean }> {
   const [titleFilled, htmlFilled] = await Promise.all([
     fillTitle(page, title.trim()),
     fillKnouHtml(page, html),
@@ -568,7 +601,7 @@ async function fillKnouPostForm(page, title, html) {
   return { titleFilled, htmlFilled };
 }
 
-async function selectTistoryCategory(page, category) {
+async function selectTistoryCategory(page: Page, category: unknown): Promise<FormResult> {
   const wanted = String(category ?? "").trim();
   if (!wanted) return { attempted: false, ok: true };
 
@@ -577,7 +610,7 @@ async function selectTistoryCategory(page, category) {
     scope.locator("select#category"),
   ]);
   if (nativeSelect) {
-    const selected = await nativeSelect.selectOption({ label: wanted }).catch(() => []);
+    const selected = await nativeSelect.selectOption({ label: wanted }).catch(() => [] as string[]);
     return { attempted: true, ok: selected.length > 0 };
   }
 
@@ -599,11 +632,11 @@ async function selectTistoryCategory(page, category) {
   return { attempted: true, ok: true };
 }
 
-function escapeRegExp(value) {
+function escapeRegExp(value: string): string {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function replaceTistoryTags(page, tags) {
+async function replaceTistoryTags(page: Page, tags: string[]): Promise<boolean> {
   const tagInput = await firstVisibleAcrossFrames(page, (scope) => [
     scope.locator('input[placeholder="태그입력"]'),
     scope.locator('input[placeholder*="태그"]'),
@@ -624,12 +657,12 @@ async function replaceTistoryTags(page, tags) {
   return true;
 }
 
-export async function fillTistoryPostForm(page, {
+export async function fillTistoryPostForm(page: Page, {
   title,
   html,
   tags = [],
   category = "",
-} = {}) {
+}: { title?: string; html?: string; tags?: unknown; category?: unknown } = {}): Promise<FormResult> {
   const normalizedTags = normalizeTistoryTags(tags);
   const categoryResult = await selectTistoryCategory(page, category);
   if (categoryResult.attempted && !categoryResult.ok) {
@@ -662,7 +695,7 @@ export async function fillTistoryPostForm(page, {
   return { ok: true, tags: normalizedTags };
 }
 
-function attachmentBuffer(attachment) {
+function attachmentBuffer(attachment: any): { buffer: Buffer; mimeType: string } | null {
   const dataUrl = String(attachment?.dataUrl ?? "");
   const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$/i.exec(dataUrl);
   if (!match) return null;
@@ -671,17 +704,17 @@ function attachmentBuffer(attachment) {
   return { buffer, mimeType: match[1].toLowerCase() };
 }
 
-function imageExtension(mimeType) {
-  return {
+function imageExtension(mimeType: string): string {
+  return ({
     "image/png": ".png",
     "image/jpeg": ".jpg",
     "image/gif": ".gif",
     "image/webp": ".webp",
-  }[mimeType] ?? ".img";
+  } as Record<string, string>)[mimeType] ?? ".img";
 }
 
-async function tistoryEditorImageSources(page) {
-  const sources = [];
+async function tistoryEditorImageSources(page: Page): Promise<Set<string>> {
+  const sources: string[] = [];
   for (const scope of searchScopes(page)) {
     const values = await scope.locator("img[src]").evaluateAll((images) => (
       images.flatMap((image) => [
@@ -690,13 +723,13 @@ async function tistoryEditorImageSources(page) {
         image.getAttribute("data-origin-src"),
         image.closest("[data-url]")?.getAttribute("data-url"),
       ]).filter(Boolean)
-    )).catch(() => []);
-    sources.push(...values);
+    )).catch(() => [] as (string | null | undefined)[]);
+    sources.push(...(values as string[]));
   }
   return new Set(sources);
 }
 
-async function resetTistoryImageFocus(page) {
+async function resetTistoryImageFocus(page: Page): Promise<void> {
   await page.keyboard.press("Escape").catch(() => undefined);
 
   const editor = await firstVisibleAcrossFrames(page, (scope) => [
@@ -707,7 +740,7 @@ async function resetTistoryImageFocus(page) {
   ]);
   if (!editor) return;
 
-  await editor.evaluate((element) => {
+  await editor.evaluate((element: HTMLElement | SVGElement) => {
     element.querySelectorAll("[data-mce-selected]").forEach((selected) => {
       selected.removeAttribute("data-mce-selected");
     });
@@ -724,15 +757,15 @@ async function resetTistoryImageFocus(page) {
   await page.waitForTimeout(100);
 }
 
-async function findTistoryImageFileInput(page) {
+async function findTistoryImageFileInput(page: Page): Promise<Locator | null> {
   for (const scope of searchScopes(page)) {
     const inputs = scope.locator('input[type="file"]');
-    const candidates = [];
+    const candidates: Array<{ input: Locator; score: number }> = [];
     const count = Math.min(await inputs.count().catch(() => 0), 20);
 
     for (let index = 0; index < count; index += 1) {
       const input = inputs.nth(index);
-      const details = await input.evaluate((element) => {
+      const details = await input.evaluate((element: HTMLElement | SVGElement) => {
         const marker = [
           element.id,
           element.getAttribute("name"),
@@ -753,7 +786,7 @@ async function findTistoryImageFileInput(page) {
           + (/(attach|upload|file|첨부|업로드)/i.test(marker) ? 10 : 0);
         return {
           contextual,
-          disabled: element.disabled,
+          disabled: (element as HTMLInputElement).disabled,
           score,
         };
       }).catch(() => null);
@@ -767,7 +800,7 @@ async function findTistoryImageFileInput(page) {
   return null;
 }
 
-async function uploadTistoryImages(page, filePaths) {
+async function uploadTistoryImages(page: Page, filePaths: string[]): Promise<Array<{ url: string; figureHtml: string }>> {
   await resetTistoryImageFocus(page);
   const before = await tistoryEditorImageSources(page);
   const fileInput = await findTistoryImageFileInput(page);
@@ -776,7 +809,7 @@ async function uploadTistoryImages(page, filePaths) {
     || await fileInput.getAttribute("multiple").then((value) => value !== null).catch(() => false)
   );
 
-  if (canUseFileInput) {
+  if (canUseFileInput && fileInput) {
     await fileInput.setInputFiles(filePaths);
   } else {
     const attachmentControl = await firstVisibleAcrossFrames(page, (scope) => [
@@ -802,14 +835,14 @@ async function uploadTistoryImages(page, filePaths) {
   }
 
   const deadline = Date.now() + Math.min(60_000, 20_000 + (filePaths.length * 5_000));
-  let latestUploads = [];
+  let latestUploads: Array<{ url: string; figureHtml: string }> = [];
   while (Date.now() < deadline) {
     await page.waitForTimeout(350);
     for (const scope of searchScopes(page)) {
       const uploaded = await scope.locator("img[src]").evaluateAll((images, previousSources) => {
         const previous = new Set(previousSources);
-        const results = [];
-        const seen = new Set();
+        const results: Array<{ url: string; figureHtml: string }> = [];
+        const seen = new Set<string>();
 
         for (const image of images) {
           const candidates = [
@@ -817,7 +850,7 @@ async function uploadTistoryImages(page, filePaths) {
             image.getAttribute("data-src"),
             image.getAttribute("data-origin-src"),
             image.closest("[data-url]")?.getAttribute("data-url"),
-          ].filter(Boolean);
+          ].filter(Boolean) as string[];
           const url = candidates.find((candidate) => (
             !previous.has(candidate)
             && !candidate.startsWith("data:")
@@ -828,7 +861,7 @@ async function uploadTistoryImages(page, filePaths) {
           seen.add(url);
 
           const originalFigure = image.closest("figure");
-          const clonedRoot = (originalFigure || image).cloneNode(true);
+          const clonedRoot = (originalFigure || image).cloneNode(true) as Element;
           const clonedImage = clonedRoot instanceof HTMLImageElement
             ? clonedRoot
             : clonedRoot.querySelector("img");
@@ -851,7 +884,7 @@ async function uploadTistoryImages(page, filePaths) {
   return latestUploads;
 }
 
-function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
+function replaceTistoryImagePlaceholder(html: string, attachmentId: string, uploaded: { url: string; figureHtml: string }): string {
   const marker = `growthlog-asset://${attachmentId}`;
   const escapedMarker = escapeRegExp(marker);
   const figurePattern = new RegExp(
@@ -875,7 +908,7 @@ function replaceTistoryImagePlaceholder(html, attachmentId, uploaded) {
   return html.replace(figurePattern, figureHtml);
 }
 
-export async function uploadTistoryAttachments(page, html, attachments) {
+export async function uploadTistoryAttachments(page: Page, html: string, attachments: any): Promise<FormResult> {
   if (!Array.isArray(attachments) || attachments.length === 0) return { ok: true, html };
   if (attachments.length > 30) {
     return { ok: false, code: "TOO_MANY_IMAGES", message: "글 하나에는 이미지 30개까지 올릴 수 있습니다." };
@@ -884,7 +917,7 @@ export async function uploadTistoryAttachments(page, html, attachments) {
   const tempDirectory = await fs.promises.mkdtemp(path.join(process.env.TMPDIR || "/tmp", "growth-log-tistory-"));
   let finalHtml = html;
   try {
-    const prepared = [];
+    const prepared: Array<{ attachment: any; id: string; filePath: string }> = [];
     for (let index = 0; index < attachments.length; index += 1) {
       const attachment = attachments[index];
       const id = String(attachment?.id ?? "").trim();
@@ -929,7 +962,7 @@ export async function uploadTistoryAttachments(page, html, attachments) {
   return { ok: true, html: finalHtml };
 }
 
-async function clickTistoryCompletion(page) {
+async function clickTistoryCompletion(page: Page): Promise<boolean> {
   const control = await firstVisible([
     page.getByRole("button", { name: /^완료$/ }),
     page.locator("button").filter({ hasText: /^완료$/ }),
@@ -940,7 +973,7 @@ async function clickTistoryCompletion(page) {
   return true;
 }
 
-export async function saveTistoryPostForm(page, mode = "draft") {
+export async function saveTistoryPostForm(page: Page, mode = "draft"): Promise<FormResult> {
   if (!(await clickTistoryCompletion(page))) {
     return {
       ok: false,
@@ -996,7 +1029,7 @@ export async function saveTistoryPostForm(page, mode = "draft") {
 }
 
 // 지역대학 글쓰기 폼의 필수 "분류(지역) 선택" 드롭다운(#bbsClSeq1 / select.sel-type)을 찾습니다.
-async function findRegionalCategorySelect(page) {
+async function findRegionalCategorySelect(page: Page): Promise<Locator | null> {
   for (const scope of searchScopes(page)) {
     for (const locator of [
       scope.locator("#bbsClSeq1"),
@@ -1011,25 +1044,26 @@ async function findRegionalCategorySelect(page) {
 
 // 게시판 이름("○○지역대학")에 맞는 지역 옵션을 골라 분류 드롭다운을 선택합니다.
 // onchange(jf_selectCl) 핸들러가 실행되도록 네이티브 change 이벤트를 발생시킵니다.
-export async function selectRegionalCategory(page, boardName) {
+export async function selectRegionalCategory(page: Page, boardName: unknown): Promise<FormResult> {
   const region = String(boardName ?? "").replace(/\s*지역대학\s*$/, "").trim();
-  if (!region) return { attempted: false };
+  if (!region) return { attempted: false, ok: false };
 
   const select = await findRegionalCategorySelect(page);
-  if (!select) return { attempted: false };
+  if (!select) return { attempted: false, ok: false };
 
   const matchedValue = await select.evaluate((element, target) => {
-    const normalize = (value) => value.replace(/\s+/g, "").trim();
+    const normalize = (value: string) => value.replace(/\s+/g, "").trim();
     const wanted = normalize(target);
-    const options = Array.from(element.options);
-    const option = options.find((item) => normalize(item.textContent) === wanted)
+    const selectElement = element as HTMLSelectElement;
+    const options = Array.from(selectElement.options);
+    const option = options.find((item) => normalize(item.textContent ?? "") === wanted)
       ?? options.find((item) => {
-        const label = normalize(item.textContent);
+        const label = normalize(item.textContent ?? "");
         return label && (label.includes(wanted) || wanted.includes(label));
       });
     if (!option || !option.value) return "";
-    element.value = option.value;
-    element.dispatchEvent(new Event("change", { bubbles: true }));
+    selectElement.value = option.value;
+    selectElement.dispatchEvent(new Event("change", { bubbles: true }));
     return option.value;
   }, region).catch(() => "");
 
@@ -1039,7 +1073,7 @@ export async function selectRegionalCategory(page, boardName) {
   return { attempted: true, ok: true, region };
 }
 
-async function hasCaptcha(page) {
+async function hasCaptcha(page: Page): Promise<boolean> {
   for (const scope of searchScopes(page)) {
     const count = await scope.locator(
       'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], '
@@ -1050,7 +1084,7 @@ async function hasCaptcha(page) {
   return false;
 }
 
-function finalSubmitLocators(scope, mode) {
+function finalSubmitLocators(scope: Scope, mode: string): Locator[] {
   const buttonName = mode === "modify"
     ? /^(저장|수정|변경|수정\s*완료|등록|저장하기)$/
     : /^(등록|저장|게시|작성\s*완료|등록하기|게시하기)$/;
@@ -1069,7 +1103,7 @@ function finalSubmitLocators(scope, mode) {
   ];
 }
 
-export async function submitPostForm(page, mode) {
+export async function submitPostForm(page: Page, mode: string): Promise<FormResult> {
   if (await hasCaptcha(page)) {
     return {
       ok: false,
@@ -1091,14 +1125,14 @@ export async function submitPostForm(page, mode) {
 
   const initialUrl = page.url();
   let dialogMessage = "";
-  let resolveSuccessDialog;
-  const successDialog = new Promise((resolve) => {
+  let resolveSuccessDialog: (value: boolean) => void = () => undefined;
+  const successDialog = new Promise<boolean>((resolve) => {
     resolveSuccessDialog = resolve;
   });
   const navigation = page.waitForURL((url) => url.href !== initialUrl, {
     timeout: NAVIGATION_TIMEOUT_MS,
   }).then(() => true).catch(() => false);
-  const acceptDialog = async (dialog) => {
+  const acceptDialog = async (dialog: Dialog) => {
     dialogMessage = dialog.message();
     const success = dialog.type() === "alert"
       && POST_COMPLETION_PATTERN.test(dialogMessage);
@@ -1110,7 +1144,7 @@ export async function submitPostForm(page, mode) {
   try {
     await submitControl.scrollIntoViewIfNeeded().catch(() => undefined);
     await submitControl.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
-      await submitControl.evaluate((element) => {
+      await submitControl.evaluate((element: HTMLElement | SVGElement) => {
         if (element instanceof HTMLElement) element.click();
       });
     });
@@ -1154,16 +1188,16 @@ export async function submitPostForm(page, mode) {
 // 새 npm 의존성 없이 Node 내장 crypto로 서비스 계정 JWT를 서명해 액세스 토큰을 발급합니다.
 
 const SHEETS_SPREADSHEET_ID = process.env.GROWTH_LOG_SHEETS_ID ?? "1gPZe8cwqKbMU2PBXg2V3mYLLT3MkhdkDZpTXcGqOtE0";
-const SHEETS_TAB_CONFIG = {
+const SHEETS_TAB_CONFIG: Record<string, { gid: string; headerRow: number }> = {
   department: { gid: "392712092", headerRow: 7 },
   regional: { gid: "1190277445", headerRow: 6 },
 };
 
-function base64url(input) {
-  return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+function base64url(input: crypto.BinaryLike): string {
+  return Buffer.from(input as any).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function columnLetter(zeroBasedIndex) {
+function columnLetter(zeroBasedIndex: number): string {
   let index = zeroBasedIndex;
   let letter = "";
   do {
@@ -1173,12 +1207,12 @@ function columnLetter(zeroBasedIndex) {
   return letter;
 }
 
-function a1Cell(sheetTitle, oneBasedRow, zeroBasedCol) {
+function a1Cell(sheetTitle: string, oneBasedRow: number, zeroBasedCol: number): string {
   return `'${String(sheetTitle).replace(/'/g, "''")}'!${columnLetter(zeroBasedCol)}${oneBasedRow}`;
 }
 
 // 서비스 계정 키를 환경변수(JSON 원문) 또는 파일 경로에서 읽습니다. 없으면 null.
-function readServiceAccount() {
+function readServiceAccount(): any {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY?.trim();
   if (!raw) return null;
   try {
@@ -1193,7 +1227,7 @@ function readServiceAccount() {
 
 let cachedSheetsToken = { value: "", expiresAt: 0 };
 
-async function getSheetsAccessToken(serviceAccount) {
+async function getSheetsAccessToken(serviceAccount: any): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   if (cachedSheetsToken.value && cachedSheetsToken.expiresAt > now + 60) return cachedSheetsToken.value;
 
@@ -1221,7 +1255,7 @@ async function getSheetsAccessToken(serviceAccount) {
   return cachedSheetsToken.value;
 }
 
-async function sheetsFetch(token, pathAndQuery, init) {
+async function sheetsFetch(token: string, pathAndQuery: string, init?: RequestInit): Promise<any> {
   const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_SPREADSHEET_ID}${pathAndQuery}`, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init?.headers ?? {}) },
@@ -1230,7 +1264,7 @@ async function sheetsFetch(token, pathAndQuery, init) {
   return response.json();
 }
 
-export function resolvePostingRoundColumns(headers, round) {
+export function resolvePostingRoundColumns(headers: string[], round: number): { names: string[]; indexes: number[]; insertAt: number } {
   const names = [`${round}차 게시`, `${round}차 게시 제목`, `${round}차 링크`, `${round}차 소개`];
   const indexes = names.map((name) => headers.indexOf(name));
   const existingCount = indexes.filter((index) => index >= 0).length;
@@ -1245,7 +1279,7 @@ export function resolvePostingRoundColumns(headers, round) {
 }
 
 // 회차 열이 없으면 게시·제목·링크·소개 열을 시트 끝에 함께 생성합니다.
-async function recordRoundCreation({ boardId, title, postUrl, round }) {
+async function recordRoundCreation({ boardId, title, postUrl, round }: { boardId: unknown; title: string; postUrl: string; round: number }): Promise<FormResult> {
   const serviceAccount = readServiceAccount();
   if (!serviceAccount) return { ok: false, skipped: true, message: "" };
 
@@ -1256,24 +1290,24 @@ async function recordRoundCreation({ boardId, title, postUrl, round }) {
 
   const token = await getSheetsAccessToken(serviceAccount);
   const meta = await sheetsFetch(token, "?fields=sheets(properties(sheetId,title))");
-  const sheet = (meta.sheets ?? []).find((item) => String(item.properties.sheetId) === config.gid);
+  const sheet = (meta.sheets ?? []).find((item: any) => String(item.properties.sheetId) === config.gid);
   if (!sheet) return { ok: false, message: "시트 기록 실패: 대상 시트 탭을 찾지 못했습니다." };
   const sheetTitle = sheet.properties.title;
 
   const read = await sheetsFetch(token, `/values/${encodeURIComponent(`'${sheetTitle}'!A${config.headerRow}:ZZ`)}`);
   const rows = read.values ?? [];
-  const headers = (rows[0] ?? []).map((cell) => String(cell ?? "").trim());
+  const headers = (rows[0] ?? []).map((cell: unknown) => String(cell ?? "").trim());
   const numberCol = headers.indexOf("번호");
   if (numberCol < 0) return { ok: false, message: "시트 기록 실패: 번호 열을 찾지 못했습니다." };
 
-  const rowOffset = rows.slice(1).findIndex((row) => String(row[numberCol] ?? "").trim() === boardNo.trim());
+  const rowOffset = rows.slice(1).findIndex((row: any[]) => String(row[numberCol] ?? "").trim() === boardNo.trim());
   if (rowOffset < 0) return { ok: false, message: `시트 기록 실패: 번호 ${boardNo} 행을 찾지 못했습니다.` };
   const targetRow = config.headerRow + 1 + rowOffset;
 
-  let columns;
+  let columns: { names: string[]; indexes: number[]; insertAt: number };
   try {
     columns = resolvePostingRoundColumns(headers, round);
-  } catch (error) {
+  } catch (error: any) {
     return { ok: false, message: `시트 기록 실패: ${error.message}` };
   }
   if (columns.insertAt >= 0) {
@@ -1316,7 +1350,7 @@ async function recordRoundCreation({ boardId, title, postUrl, round }) {
   return { ok: true, message: `운영 시트에 ${round}차 게시·제목·링크를 기록했습니다.` };
 }
 
-async function openLogin() {
+async function openLogin(): Promise<FormResult> {
   const page = await getWorkPage();
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
   await surfaceForUser(page, true);
@@ -1327,7 +1361,7 @@ async function openLogin() {
   };
 }
 
-async function openTistoryLogin(body = {}) {
+async function openTistoryLogin(body: any = {}): Promise<FormResult> {
   const manageUrl = normalizeTistoryManageUrl(body.blogUrl);
   const targetUrl = manageUrl || TISTORY_LOGIN_URL;
   const page = await getWorkPage();
@@ -1343,7 +1377,7 @@ async function openTistoryLogin(body = {}) {
   };
 }
 
-function validateTistoryPostInput(body, { requirePostUrl = false } = {}) {
+function validateTistoryPostInput(body: any, { requirePostUrl = false }: { requirePostUrl?: boolean } = {}): { ok: true; title: string; html: string } | { ok: false; code: string; message: string } {
   const title = typeof body?.title === "string" ? body.title.trim() : "";
   const html = typeof body?.html === "string" ? body.html : "";
   if (!title || title.length > 500) {
@@ -1358,12 +1392,12 @@ function validateTistoryPostInput(body, { requirePostUrl = false } = {}) {
   return { ok: true, title, html };
 }
 
-function isTistoryLoginPage(page) {
+function isTistoryLoginPage(page: Page): boolean {
   const url = page.url();
   return /accounts\.kakao\.com|\/auth\/login|\/login(?:[/?#]|$)/i.test(url);
 }
 
-async function prepareTistoryDraft(body) {
+async function prepareTistoryDraft(body: any): Promise<HttpResult> {
   const input = validateTistoryPostInput(body);
   if (!input.ok) return { status: 400, body: input };
 
@@ -1421,7 +1455,7 @@ async function prepareTistoryDraft(body) {
   }
 
   const uploaded = await uploadTistoryAttachments(page, input.html, body.attachments);
-  if (!uploaded.ok || !(await fillHtml(page, uploaded.html))) {
+  if (!uploaded.ok || !(await fillHtml(page, uploaded.html!))) {
     await surfaceForUser(page);
     return {
       status: 422,
@@ -1451,7 +1485,7 @@ async function prepareTistoryDraft(body) {
   };
 }
 
-async function prepareTistoryDraftBatch(body) {
+async function prepareTistoryDraftBatch(body: any): Promise<HttpResult> {
   const items = Array.isArray(body?.items) ? body.items : [];
   if (items.length === 0 || items.length > 30) {
     return {
@@ -1464,7 +1498,7 @@ async function prepareTistoryDraftBatch(body) {
     };
   }
 
-  const results = [];
+  const results: any[] = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] ?? {};
     const result = await prepareTistoryDraft({
@@ -1495,11 +1529,11 @@ async function prepareTistoryDraftBatch(body) {
   };
 }
 
-async function prepareTistoryModification(body) {
+async function prepareTistoryModification(body: any): Promise<HttpResult> {
   const input = validateTistoryPostInput(body, { requirePostUrl: true });
   if (!input.ok) return { status: 400, body: input };
 
-  const postUrl = tistoryUrl(body.postUrl);
+  const postUrl = tistoryUrl(body.postUrl)!;
   await prepareBrowserInBackground();
   const page = await getWorkPage();
   await page.goto(postUrl.href, { waitUntil: "domcontentloaded" });
@@ -1564,7 +1598,7 @@ async function prepareTistoryModification(body) {
   }
 
   const uploaded = await uploadTistoryAttachments(page, input.html, body.attachments);
-  if (!uploaded.ok || !(await fillHtml(page, uploaded.html))) {
+  if (!uploaded.ok || !(await fillHtml(page, uploaded.html!))) {
     await surfaceForUser(page);
     return {
       status: 422,
@@ -1603,7 +1637,7 @@ async function prepareTistoryModification(body) {
   };
 }
 
-async function prepareModification(body) {
+async function prepareModification(body: any): Promise<HttpResult> {
   const { boardName, postUrl, title, html, confirmFinalSubmit } = body ?? {};
 
   if (!isKnouUrl(postUrl)) {
@@ -1697,7 +1731,7 @@ async function prepareModification(body) {
   };
 }
 
-async function autoLogin(body) {
+async function autoLogin(body: any): Promise<HttpResult> {
   const { username, password } = body ?? {};
 
   if (typeof username !== "string" || username.trim().length === 0 || username.length > 200) {
@@ -1743,7 +1777,7 @@ async function autoLogin(body) {
   };
 }
 
-async function prepareCreation(body) {
+async function prepareCreation(body: any): Promise<HttpResult> {
   const { boardId, boardName, boardUrl, title, html, round, confirmFinalSubmit } = body ?? {};
   const postRound = Number(round);
 
@@ -1844,7 +1878,7 @@ async function prepareCreation(body) {
       title: title.trim(),
       postUrl: writePage.url(),
       round: postRound,
-    }).catch((error) => ({ ok: false, message: `시트 기록 오류: ${error?.message ?? error}` }));
+    }).catch((error: any) => ({ ok: false, message: `시트 기록 오류: ${error?.message ?? error}` } as FormResult));
     if (recorded.message) sheetNote = ` ${recorded.message}`;
 
     return {
@@ -1870,7 +1904,7 @@ async function prepareCreation(body) {
   };
 }
 
-async function respondWithBrowserTask(response, origin, task) {
+async function respondWithBrowserTask(response: http.ServerResponse, origin: string, task: () => any): Promise<void> {
   const result = await browserTaskQueue.run(task);
   const isHttpResult = result
     && Number.isInteger(result.status)
@@ -1883,12 +1917,12 @@ async function respondWithBrowserTask(response, origin, task) {
   );
 }
 
-async function respondWithBodyBrowserTask(request, response, origin, task) {
+async function respondWithBodyBrowserTask(request: http.IncomingMessage, response: http.ServerResponse, origin: string, task: (body: any) => any): Promise<void> {
   const body = await readBody(request);
   await respondWithBrowserTask(response, origin, () => task(body));
 }
 
-function createServer() {
+function createServer(): http.Server {
   return http.createServer(async (request, response) => {
     const origin = request.headers.origin ?? "";
     if (!isPotentialOrigin(origin)) {
@@ -1987,6 +2021,19 @@ function createServer() {
   });
 }
 
+interface StartOptions {
+  host?: string;
+  port?: number;
+  profileDir?: string;
+  browserEndpoint?: string;
+  automationPageUrl?: string;
+  showAutomationWindow?: WindowToggle;
+  hideAutomationWindow?: WindowToggle;
+  extraAllowedOrigins?: string[];
+  isPairedOrigin?: (origin: string, token: string) => boolean;
+  quiet?: boolean;
+}
+
 export async function startBrowserAutomation({
   host = "127.0.0.1",
   port = Number(process.env.BROWSER_AUTOMATION_PORT ?? 4317),
@@ -1998,7 +2045,7 @@ export async function startBrowserAutomation({
   extraAllowedOrigins = [],
   isPairedOrigin = () => false,
   quiet = false,
-} = {}) {
+}: StartOptions = {}): Promise<ActiveServer> {
   if (activeServer) return activeServer;
 
   HOST = host;
@@ -2017,7 +2064,7 @@ export async function startBrowserAutomation({
   if (embeddedBrowserEndpoint) await getContext();
 
   const server = createServer();
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(PORT, HOST, () => {
       server.off("error", reject);

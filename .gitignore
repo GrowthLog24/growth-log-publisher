@@ -6,8 +6,8 @@
 /out/
 /dist/
 
-# Generated runtime copy
-/generated/
+# TypeScript build output
+/dist/
 
 # Tests and local runtime data
 /coverage

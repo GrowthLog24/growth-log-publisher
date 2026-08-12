@@ -28,9 +28,10 @@ tistory_gl5_subjects/
 ## 구성
 
 ```text
-src/              Electron 트레이 앱
-browser-automation.mjs   Playwright 브라우저 자동화와 로컬 HTTP 서버
-tests/            자동화 및 서버 테스트
+src/main.ts                Electron 트레이 앱
+src/browser-automation.ts  Playwright 브라우저 자동화와 로컬 HTTP 서버
+tests/                     자동화 및 서버 테스트
+dist/                      TypeScript 빌드 결과물 (tsc)
 ```
 
 실행 방식은 `npm start` 하나로 통일합니다. 자동화 브라우저의 로그인 상태는 Electron의 사용자별 앱 데이터에 저장됩니다. 평상시 자동화 창은 숨겨진 상태로 동작하며, 로그인·CAPTCHA·오류 확인이 필요할 때만 화면에 표시됩니다.

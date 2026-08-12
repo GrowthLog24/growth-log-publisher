@@ -12,7 +12,7 @@ import {
   saveTistoryPostForm,
   submitPostForm,
   uploadTistoryAttachments,
-} from "../browser-automation.mjs";
+} from "../src/browser-automation.js";
 
 test("maps or creates a complete posting-round column group", () => {
   assert.deepEqual(resolvePostingRoundColumns(["번호", "1차 게시", "1차 게시 제목", "1차 링크", "1차 소개"], 1), {

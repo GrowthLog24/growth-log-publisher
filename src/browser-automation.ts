@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -914,7 +915,7 @@ export async function uploadTistoryAttachments(page: Page, html: string, attachm
     return { ok: false, code: "TOO_MANY_IMAGES", message: "글 하나에는 이미지 30개까지 올릴 수 있습니다." };
   }
 
-  const tempDirectory = await fs.promises.mkdtemp(path.join(process.env.TMPDIR || "/tmp", "growth-log-tistory-"));
+  const tempDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "growth-log-tistory-"));
   let finalHtml = html;
   try {
     const prepared: Array<{ attachment: any; id: string; filePath: string }> = [];

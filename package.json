@@ -7,7 +7,7 @@
   "type": "module",
   "main": "dist/src/main.js",
   "scripts": {
-    "build": "tsc && cp src/status.html dist/src/status.html",
+    "build": "tsc && node -e \"require('fs').copyFileSync('src/status.html','dist/src/status.html')\"",
     "prestart": "npm run build",
     "start": "electron .",
     "prepackage": "npm run build",

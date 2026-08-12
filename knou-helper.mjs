@@ -848,7 +848,7 @@ export async function submitPostForm(page, mode) {
   };
 }
 
-// ─── 운영 Google Sheets 기록 (게시 성공 시 2차 게시/제목/링크 write-back) ──────────
+// ─── 운영 Google Sheets 기록 (회차별 게시 날짜/제목/링크 write-back) ────────────
 // GOOGLE_SERVICE_ACCOUNT_KEY(서비스 계정 JSON 원문 또는 파일 경로)가 설정된 경우에만 동작합니다.
 // 새 npm 의존성 없이 Node 내장 crypto로 서비스 계정 JWT를 서명해 액세스 토큰을 발급합니다.
 
@@ -929,9 +929,22 @@ async function sheetsFetch(token, pathAndQuery, init) {
   return response.json();
 }
 
-// 게시 성공 후 해당 게시판 행에 2차 게시(날짜)·2차 게시 제목·2차 링크를 기록합니다.
-// "2차 게시 제목" 열이 없으면 "2차 게시" 열 오른쪽에 새로 삽입합니다.
-async function recordSecondRoundCreation({ boardId, title, postUrl }) {
+export function resolvePostingRoundColumns(headers, round) {
+  const names = [`${round}차 게시`, `${round}차 게시 제목`, `${round}차 링크`, `${round}차 소개`];
+  const indexes = names.map((name) => headers.indexOf(name));
+  const existingCount = indexes.filter((index) => index >= 0).length;
+  if (existingCount === 0) {
+    return { names, indexes: names.map((_, offset) => headers.length + offset), insertAt: headers.length };
+  }
+  if (existingCount !== names.length) {
+    const missing = names.filter((_, index) => indexes[index] < 0).join("·");
+    throw new Error(`${round}차 열 구조가 불완전합니다. 누락: ${missing}`);
+  }
+  return { names, indexes, insertAt: -1 };
+}
+
+// 회차 열이 없으면 게시·제목·링크·소개 열을 시트 끝에 함께 생성합니다.
+async function recordRoundCreation({ boardId, title, postUrl, round }) {
   const serviceAccount = readServiceAccount();
   if (!serviceAccount) return { ok: false, skipped: true, message: "" };
 
@@ -950,47 +963,56 @@ async function recordSecondRoundCreation({ boardId, title, postUrl }) {
   const rows = read.values ?? [];
   const headers = (rows[0] ?? []).map((cell) => String(cell ?? "").trim());
   const numberCol = headers.indexOf("번호");
-  const postCol = headers.indexOf("2차 게시");
-  let linkCol = headers.indexOf("2차 링크");
-  if (numberCol < 0 || postCol < 0 || linkCol < 0) {
-    return { ok: false, message: "시트 기록 실패: 필수 열(번호·2차 게시·2차 링크)을 찾지 못했습니다." };
-  }
+  if (numberCol < 0) return { ok: false, message: "시트 기록 실패: 번호 열을 찾지 못했습니다." };
 
   const rowOffset = rows.slice(1).findIndex((row) => String(row[numberCol] ?? "").trim() === boardNo.trim());
   if (rowOffset < 0) return { ok: false, message: `시트 기록 실패: 번호 ${boardNo} 행을 찾지 못했습니다.` };
   const targetRow = config.headerRow + 1 + rowOffset;
 
-  let titleCol = headers.indexOf("2차 게시 제목");
-  const needsColumn = titleCol < 0;
-  if (needsColumn) {
+  let columns;
+  try {
+    columns = resolvePostingRoundColumns(headers, round);
+  } catch (error) {
+    return { ok: false, message: `시트 기록 실패: ${error.message}` };
+  }
+  if (columns.insertAt >= 0) {
     await sheetsFetch(token, ":batchUpdate", {
       method: "POST",
       body: JSON.stringify({
         requests: [{
           insertDimension: {
-            range: { sheetId: sheet.properties.sheetId, dimension: "COLUMNS", startIndex: postCol + 1, endIndex: postCol + 2 },
+            range: {
+              sheetId: sheet.properties.sheetId,
+              dimension: "COLUMNS",
+              startIndex: columns.insertAt,
+              endIndex: columns.insertAt + columns.names.length,
+            },
             inheritFromBefore: true,
           },
         }],
       }),
     });
-    titleCol = postCol + 1;
-    if (linkCol >= titleCol) linkCol += 1; // 삽입으로 오른쪽 열이 한 칸 밀립니다.
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const [postCol, titleCol, linkCol] = columns.indexes;
+  const today = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const data = [
     { range: a1Cell(sheetTitle, targetRow, postCol), values: [[today]] },
     { range: a1Cell(sheetTitle, targetRow, titleCol), values: [[title]] },
     { range: a1Cell(sheetTitle, targetRow, linkCol), values: [[postUrl]] },
   ];
-  if (needsColumn) data.push({ range: a1Cell(sheetTitle, config.headerRow, titleCol), values: [["2차 게시 제목"]] });
+  if (columns.insertAt >= 0) {
+    data.push({
+      range: `${a1Cell(sheetTitle, config.headerRow, columns.insertAt)}:${columnLetter(columns.insertAt + columns.names.length - 1)}${config.headerRow}`,
+      values: [columns.names],
+    });
+  }
 
   await sheetsFetch(token, "/values:batchUpdate", {
     method: "POST",
     body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
   });
-  return { ok: true, message: "운영 시트에 2차 게시·제목·링크를 기록했습니다." };
+  return { ok: true, message: `운영 시트에 ${round}차 게시·제목·링크를 기록했습니다.` };
 }
 
 async function openLogin() {
@@ -1415,6 +1437,7 @@ async function autoLogin(body) {
 
 async function prepareCreation(body) {
   const { boardId, boardName, boardUrl, title, html, round, confirmFinalSubmit } = body ?? {};
+  const postRound = Number(round);
 
   if (!isKnouUrl(boardUrl)) {
     return { status: 400, body: { ok: false, code: "INVALID_BOARD_URL", message: "방송대 게시판 URL만 열 수 있습니다." } };
@@ -1424,6 +1447,9 @@ async function prepareCreation(body) {
   }
   if (typeof html !== "string" || html.trim().length === 0 || html.length > 600_000) {
     return { status: 400, body: { ok: false, code: "INVALID_HTML", message: "게시할 HTML 내용을 입력해 주세요." } };
+  }
+  if (!Number.isInteger(postRound) || postRound < 1) {
+    return { status: 400, body: { ok: false, code: "INVALID_ROUND", message: "게시 회차는 1 이상의 정수여야 합니다." } };
   }
 
   const page = await getWorkPage();
@@ -1498,17 +1524,16 @@ async function prepareCreation(body) {
       };
     }
 
-    // 2차 게시가 실제로 등록된 뒤에만 운영 시트에 2차 게시/제목/링크를 기록합니다.
+    // 게시가 실제로 등록된 뒤에만 운영 시트의 해당 회차에 기록합니다.
     // 시트 기록 실패는 이미 성공한 게시를 무효화하지 않도록 안내 문구로만 반영합니다.
     let sheetNote = "";
-    if (Number(round) === 2) {
-      const recorded = await recordSecondRoundCreation({
-        boardId,
-        title: title.trim(),
-        postUrl: writePage.url(),
-      }).catch((error) => ({ ok: false, message: `시트 기록 오류: ${error?.message ?? error}` }));
-      if (recorded.message) sheetNote = ` ${recorded.message}`;
-    }
+    const recorded = await recordRoundCreation({
+      boardId,
+      title: title.trim(),
+      postUrl: writePage.url(),
+      round: postRound,
+    }).catch((error) => ({ ok: false, message: `시트 기록 오류: ${error?.message ?? error}` }));
+    if (recorded.message) sheetNote = ` ${recorded.message}`;
 
     return {
       status: 200,

@@ -4,6 +4,9 @@ import { chromium } from "playwright-core";
 import {
   fillKnouHtml,
   fillTistoryPostForm,
+  knouArticleNo,
+  knouMessageRedirectUrl,
+  matchesPostTitle,
   normalizeTistoryManageUrl,
   normalizeTistoryTags,
   openEditForm,
@@ -15,17 +18,83 @@ import {
 } from "../src/browser-automation.js";
 
 test("maps or creates a complete posting-round column group", () => {
-  assert.deepEqual(resolvePostingRoundColumns(["번호", "1차 게시", "1차 게시 제목", "1차 링크", "1차 소개"], 1), {
-    names: ["1차 게시", "1차 게시 제목", "1차 링크", "1차 소개"],
+  assert.deepEqual(resolvePostingRoundColumns(["번호", "1차 게시", "1차 게시 제목", "1차 링크", "1차 소계"], 1), {
+    names: ["1차 게시", "1차 게시 제목", "1차 링크", "1차 소계"],
     indexes: [1, 2, 3, 4],
     insertAt: -1,
   });
   assert.deepEqual(resolvePostingRoundColumns(["번호"], 2), {
-    names: ["2차 게시", "2차 게시 제목", "2차 링크", "2차 소개"],
+    names: ["2차 게시", "2차 게시 제목", "2차 링크", "2차 소계"],
     indexes: [1, 2, 3, 4],
     insertAt: 1,
   });
   assert.throws(() => resolvePostingRoundColumns(["번호", "3차 게시"], 3), /3차 열 구조가 불완전/);
+});
+
+test("extracts the board list URL from the KNOU post-submit message page", () => {
+  const messageUrl = "https://law.knou.ac.kr/message/message.do?siteId=law"
+    + "&message=%EA%B2%8C%EC%8B%9C%EB%AC%BC%EC%9D%84%28%EB%A5%BC%29+%EB%93%B1%EB%A1%9D%ED%96%88%EC%8A%B5%EB%8B%88%EB%8B%A4."
+    + "&location=%2Fbbs%2Flaw%2F2210%2FartclList.do%3Fpage%3D1%26layout%3DvHzWp64Tf%252BQaMalMHiNLJA%253D%253D";
+  assert.equal(
+    knouMessageRedirectUrl(messageUrl),
+    "https://law.knou.ac.kr/bbs/law/2210/artclList.do?page=1&layout=vHzWp64Tf%2BQaMalMHiNLJA%3D%3D",
+  );
+
+  // 안내 페이지가 아니거나 location이 없으면 손대지 않습니다.
+  assert.equal(knouMessageRedirectUrl("https://law.knou.ac.kr/bbs/law/2210/807731/artclView.do"), null);
+  assert.equal(knouMessageRedirectUrl("https://law.knou.ac.kr/message/message.do?siteId=law"), null);
+  assert.equal(knouMessageRedirectUrl("not-a-url"), null);
+});
+
+test("reads the KNOU article number from both post URL shapes", () => {
+  // 경로에 글 번호가 그대로 들어있는 형태
+  assert.equal(knouArticleNo("https://jpn.knou.ac.kr/bbs/jpn/2195/807731/artclView.do"), 807731);
+  // enc(base64 안에 URL 인코딩된 경로)에 들어있는 형태
+  assert.equal(
+    knouArticleNo(
+      "https://jpn.knou.ac.kr/jpn/5205/subview.do"
+      + "?enc=Zm5jdDF8QEB8JTJGYmJzJTJGanBuJTJGMjE5NSUyRjgwNjM2MCUyRmFydGNsVmlldy5kbyUzRg%3D%3D",
+    ),
+    806360,
+  );
+  // 상대 경로도 목록 주소를 기준으로 해석합니다.
+  assert.equal(
+    knouArticleNo("/bbs/law/2210/807731/artclView.do", "https://law.knou.ac.kr/bbs/law/2210/artclList.do"),
+    807731,
+  );
+  // 글 번호를 알 수 없는 링크
+  assert.equal(knouArticleNo("#"), null);
+  assert.equal(knouArticleNo("https://law.knou.ac.kr/bbs/law/2210/artclList.do?page=1"), null);
+
+  // 같은 제목이 여럿일 때 가장 큰 번호가 방금 올린 글입니다.
+  const listed = [
+    "https://law.knou.ac.kr/bbs/law/2210/806364/artclView.do",
+    "https://law.knou.ac.kr/bbs/law/2210/808850/artclView.do",
+    "https://law.knou.ac.kr/bbs/law/2210/807731/artclView.do",
+  ];
+  const newest = listed.reduce((best, url) => (knouArticleNo(url)! > knouArticleNo(best)! ? url : best));
+  assert.equal(newest, "https://law.knou.ac.kr/bbs/law/2210/808850/artclView.do");
+});
+
+test("matches list titles despite icon text, whitespace and truncation", () => {
+  const title = "[신입 모집] 나의 아이디어를 AI로 실현하는 곳, 그로스로그";
+
+  assert.equal(matchesPostTitle(title, title), true);
+  // 줄바꿈·중복 공백
+  assert.equal(matchesPostTitle("[신입 모집]  나의 아이디어를 AI로\n실현하는 곳, 그로스로그", title), true);
+  // "새글"·"첨부파일" 같은 아이콘 텍스트가 붙는 경우
+  assert.equal(matchesPostTitle(`${title} 새글`, title), true);
+  assert.equal(matchesPostTitle(`첨부파일 ${title}`, title), true);
+  // 목록에서 말줄임된 경우
+  assert.equal(matchesPostTitle("[신입 모집] 나의 아이디어를 AI로 실현하는…", title), true);
+  assert.equal(matchesPostTitle("[신입 모집] 나의 아이디어를 AI로 실현하는...", title), true);
+
+  // 다른 글은 걸리면 안 됩니다.
+  assert.equal(matchesPostTitle("[신입 모집] AI를 배우고 활용하고 싶은 방송대 학우, 그로스로그와 함께해요", title), false);
+  assert.equal(matchesPostTitle("이전글", title), false);
+  assert.equal(matchesPostTitle("", title), false);
+  // 짧은 조각은 말줄임 규칙으로도 통과시키지 않습니다.
+  assert.equal(matchesPostTitle("[신입…", title), false);
 });
 
 test("opens KNOU write and edit controls and clicks the confirmed final action", async () => {

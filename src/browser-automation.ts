@@ -61,6 +61,7 @@ function positiveNumber(value: unknown, fallback: number): number {
 const ACTION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_ACTION_TIMEOUT_MS, 20_000);
 const NAVIGATION_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_NAVIGATION_TIMEOUT_MS, 30_000);
 const POST_FORM_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_POST_FORM_TIMEOUT_MS, 30_000);
+const CONFIRM_LAYER_TIMEOUT_MS = positiveNumber(process.env.BROWSER_AUTOMATION_CONFIRM_LAYER_TIMEOUT_MS, 5_000);
 const POST_COMPLETION_PATTERN = /(등록|저장).{0,20}(완료|되었습니다|성공)|완료되었습니다/;
 let allowedOrigins = new Set(
   (process.env.BROWSER_AUTOMATION_ALLOWED_ORIGINS ?? "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001")
@@ -320,6 +321,19 @@ async function firstVisibleAcrossFrames(page: Page, createLocators: LocatorFacto
     const candidate = await firstVisible(createLocators(scope)).catch(() => null);
     if (candidate) return candidate;
   }
+  return null;
+}
+
+// 클릭 직후 뜨는 레이어처럼 조금 뒤에 나타나는 요소를 기다렸다가 찾습니다.
+async function waitForVisibleAcrossFrames(page: Page, createLocators: LocatorFactory, timeoutMs: number): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    for (const scope of searchScopes(page)) {
+      const candidate = await firstVisible(createLocators(scope)).catch(() => null);
+      if (candidate) return candidate;
+    }
+    await page.waitForTimeout(200).catch(() => undefined);
+  } while (Date.now() < deadline);
   return null;
 }
 
@@ -584,21 +598,23 @@ export async function fillKnouHtml(page: Page, html: string): Promise<boolean> {
   const source = await findVisibleNamoSource(page);
   if (!source) return false;
 
-  await source.fill(html);
+  // Namo 편집기의 HTML 소스 textarea는 편집기가 자체 관리해서 Playwright의
+  // fill() actionability 검사(visible·enabled·editable)를 통과하지 못한 채 멈춥니다.
+  // 값을 직접 넣고 편집기가 듣는 이벤트를 쏘는 방식으로 우회합니다.
+  await assignHtml(source, html);
   await source.evaluate((element: HTMLElement | SVGElement) => {
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
     element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "End" }));
     element.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
   });
-  return (await source.inputValue()) === html;
+  if ((await source.inputValue().catch(() => "")) === html) return true;
+  return fillHtml(page, html);
 }
 
+// 제목과 HTML을 동시에 채우면 Namo 편집기의 HTML 모드 전환과 제목 탐색용
+// 스크롤이 겹쳐 소스 textarea가 사라집니다. 순차로 채웁니다.
 async function fillKnouPostForm(page: Page, title: string, html: string): Promise<{ titleFilled: boolean; htmlFilled: boolean }> {
-  const [titleFilled, htmlFilled] = await Promise.all([
-    fillTitle(page, title.trim()),
-    fillKnouHtml(page, html),
-  ]);
+  const titleFilled = await fillTitle(page, title.trim());
+  const htmlFilled = await fillKnouHtml(page, html);
   return { titleFilled, htmlFilled };
 }
 
@@ -1104,6 +1120,121 @@ function finalSubmitLocators(scope: Scope, mode: string): Locator[] {
   ];
 }
 
+// 방송대는 등록 직후 "게시물을(를) 등록했습니다." 안내 페이지(/message/message.do)로
+// 보냅니다. 그 주소를 그대로 기록하면 목록으로 되돌아가는 링크만 남습니다.
+// location 파라미터에 담긴 목록 주소를 꺼냅니다. 안내 페이지가 아니면 null.
+export function knouMessageRedirectUrl(currentUrl: string): string | null {
+  try {
+    const url = new URL(currentUrl);
+    if (!url.pathname.endsWith("/message/message.do")) return null;
+    const location = url.searchParams.get("location");
+    return location ? new URL(location, url.origin).href : null;
+  } catch {
+    return null;
+  }
+}
+
+// 방송대 글 주소에서 글 번호를 뽑습니다. 두 가지 형태를 모두 처리합니다.
+//   .../bbs/law/2210/807731/artclView.do            (경로에 그대로)
+//   .../law/5176/subview.do?enc=<base64>            (base64 안에 URL 인코딩되어 있음)
+export function knouArticleNo(rawUrl: string, base = "https://knou.ac.kr"): number | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl, base);
+  } catch {
+    return null;
+  }
+
+  const candidates = [url.pathname];
+  const enc = url.searchParams.get("enc");
+  if (enc) {
+    try {
+      candidates.push(decodeURIComponent(Buffer.from(enc, "base64").toString("utf8")));
+    } catch {
+      // enc가 깨졌으면 경로만 봅니다.
+    }
+  }
+
+  for (const candidate of candidates) {
+    const match = /\/(\d+)\/artclView\.do/.exec(candidate);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+// 목록의 제목 링크에는 "새글"·"첨부" 아이콘 텍스트나 말줄임이 섞여 들어갑니다.
+// 정확히 일치 → 서로 포함 → 말줄임된 앞부분 일치 순으로 느슨하게 맞춥니다.
+export function matchesPostTitle(linkText: string, title: string): boolean {
+  const text = linkText.replace(/\s+/g, " ").trim();
+  const wanted = title.replace(/\s+/g, " ").trim();
+  if (!text || !wanted) return false;
+  if (text === wanted) return true;
+  if (text.includes(wanted) || wanted.includes(text)) return true;
+  const truncated = text.replace(/[.…]+$/, "").trim();
+  return truncated.length >= 10 && wanted.startsWith(truncated);
+}
+
+// 페이지(및 모든 프레임)의 링크를 텍스트·절대주소 쌍으로 한 번에 걷어옵니다.
+async function collectLinks(page: Page): Promise<{ text: string; href: string }[]> {
+  const collected: { text: string; href: string }[] = [];
+  for (const scope of searchScopes(page)) {
+    const links = await scope.evaluate(() => Array.from(document.querySelectorAll("a[href]"))
+      .map((anchor) => ({
+        text: (anchor.textContent ?? "").replace(/\s+/g, " ").trim(),
+        href: (anchor as HTMLAnchorElement).href,
+      }))).catch(() => [] as { text: string; href: string }[]);
+    collected.push(...links);
+  }
+  return collected;
+}
+
+// 안내 페이지에서 목록으로 이동한 뒤, 방금 올린 제목의 글 주소를 찾습니다.
+// 링크를 직접 훑어 주소를 얻으므로 글을 클릭해 열 필요가 없습니다.
+// 못 찾으면 현재 주소(목록)를 쓰고 matched=false로 알립니다.
+async function resolveCreatedPostUrl(page: Page, title: string): Promise<{ url: string; matched: boolean }> {
+  const listUrl = knouMessageRedirectUrl(page.url());
+  if (listUrl) {
+    await page.goto(listUrl, { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS })
+      .catch(() => undefined);
+  }
+
+  // 목록이 늦게 그려질 수 있으므로 글 링크가 하나라도 보일 때까지 기다립니다.
+  const deadline = Date.now() + ACTION_TIMEOUT_MS;
+  let posts: { text: string; href: string; articleNo: number }[] = [];
+  do {
+    posts = (await collectLinks(page))
+      .map((link) => ({ ...link, articleNo: knouArticleNo(link.href) }))
+      .filter((link): link is { text: string; href: string; articleNo: number } => link.articleNo !== null);
+    if (posts.length > 0) break;
+    await page.waitForTimeout(250).catch(() => undefined);
+  } while (Date.now() < deadline);
+
+  const matched = posts.filter((post) => matchesPostTitle(post.text, title));
+  if (matched.length === 0) return { url: page.url(), matched: false };
+
+  // 회차마다 제목이 같으면 동명의 글이 여럿 걸립니다. 방금 올린 글이 번호가
+  // 가장 크므로 번호로 고릅니다. 상단 고정 공지가 섞여도 안전합니다.
+  const newest = matched.reduce((best, post) => (post.articleNo > best.articleNo ? post : best));
+  return { url: newest.href, matched: true };
+}
+
+// 방송대는 최종 등록 클릭 뒤 브라우저 기본 confirm이 아니라 자체 레이어를 띄웁니다.
+// 확인 버튼은 `input.confirmBtnOk`(value="YES")라 역할·이름 기반으로는 잡히지 않습니다.
+function confirmLayerLocators(scope: Scope): Locator[] {
+  return [
+    scope.locator(
+      'input.confirmBtnOk[type="button"], input.confirmBtnOk[type="submit"], '
+      + "a.confirmBtnOk, button.confirmBtnOk",
+    ),
+    scope.getByRole("dialog").getByRole("button", { name: /^(확인|예|YES|등록|저장)$/i }),
+    scope.getByRole("alertdialog").getByRole("button", { name: /^(확인|예|YES|등록|저장)$/i }),
+    scope.locator('[class*="confirm" i], [class*="layerPopup" i]').locator(
+      'input[type="button"][value="YES" i], input[type="submit"][value="YES" i], '
+      + 'input[type="button"][value="확인"], input[type="submit"][value="확인"]',
+    ),
+  ];
+}
+
 export async function submitPostForm(page: Page, mode: string): Promise<FormResult> {
   if (await hasCaptcha(page)) {
     return {
@@ -1129,6 +1260,7 @@ export async function submitPostForm(page: Page, mode: string): Promise<FormResu
   let resolveSuccessDialog: (value: boolean) => void = () => undefined;
   const successDialog = new Promise<boolean>((resolve) => {
     resolveSuccessDialog = resolve;
+    setTimeout(() => resolve(false), NAVIGATION_TIMEOUT_MS).unref?.();
   });
   const navigation = page.waitForURL((url) => url.href !== initialUrl, {
     timeout: NAVIGATION_TIMEOUT_MS,
@@ -1150,10 +1282,14 @@ export async function submitPostForm(page: Page, mode: string): Promise<FormResu
       });
     });
 
-    const confirmControl = await firstVisibleAcrossFrames(page, (scope) => [
-      scope.getByRole("dialog").getByRole("button", { name: /^(확인|예|등록|저장)$/ }),
-    ]);
-    if (confirmControl) await confirmControl.click();
+    const confirmControl = await waitForVisibleAcrossFrames(page, confirmLayerLocators, CONFIRM_LAYER_TIMEOUT_MS);
+    if (confirmControl) {
+      await confirmControl.click({ timeout: ACTION_TIMEOUT_MS }).catch(async () => {
+        await confirmControl.evaluate((element: HTMLElement | SVGElement) => {
+          if (element instanceof HTMLElement) element.click();
+        });
+      });
+    }
 
     const completionText = page.waitForFunction((patternSource) => {
       const text = document.body?.innerText ?? "";
@@ -1161,7 +1297,14 @@ export async function submitPostForm(page: Page, mode: string): Promise<FormResu
     }, POST_COMPLETION_PATTERN.source, {
       timeout: NAVIGATION_TIMEOUT_MS,
     }).then(() => true).catch(() => false);
-    const confirmed = await Promise.race([navigation, completionText, successDialog]);
+    // 셋 중 하나라도 성공을 확인하면 성공입니다. Promise.race는 먼저 끝난 false가
+    // 이겨버립니다(페이지가 실제로 이동하면 waitForFunction이 즉시 거부됨).
+    const confirmed = await Promise.any(
+      [navigation, completionText, successDialog].map(async (signal) => {
+        if (await signal) return true;
+        throw new Error("unconfirmed");
+      }),
+    ).catch(() => false);
     if (!confirmed) {
       return {
         ok: false,
@@ -1190,8 +1333,8 @@ export async function submitPostForm(page: Page, mode: string): Promise<FormResu
 
 const SHEETS_SPREADSHEET_ID = process.env.GROWTH_LOG_SHEETS_ID ?? "1gPZe8cwqKbMU2PBXg2V3mYLLT3MkhdkDZpTXcGqOtE0";
 const SHEETS_TAB_CONFIG: Record<string, { gid: string; headerRow: number }> = {
-  department: { gid: "392712092", headerRow: 7 },
-  regional: { gid: "1190277445", headerRow: 6 },
+  department: { gid: "392712092", headerRow: 2 },
+  regional: { gid: "1190277445", headerRow: 2 },
 };
 
 function base64url(input: crypto.BinaryLike): string {
@@ -1212,10 +1355,13 @@ function a1Cell(sheetTitle: string, oneBasedRow: number, zeroBasedCol: number): 
   return `'${String(sheetTitle).replace(/'/g, "''")}'!${columnLetter(zeroBasedCol)}${oneBasedRow}`;
 }
 
-// 서비스 계정 키를 환경변수(JSON 원문) 또는 파일 경로에서 읽습니다. 없으면 null.
+// 패키지 앱을 Finder에서 실행하면 셸 환경변수를 물려받지 못합니다.
+// 환경변수가 없을 때 읽을 기본 키 경로.
+const DEFAULT_SERVICE_ACCOUNT_PATH = path.join(os.homedir(), ".config", "growth-log", "sheets-key.json");
+
+// 서비스 계정 키를 환경변수(JSON 원문 또는 파일 경로)에서, 없으면 기본 경로에서 읽습니다. 없으면 null.
 function readServiceAccount(): any {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY?.trim();
-  if (!raw) return null;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY?.trim() || DEFAULT_SERVICE_ACCOUNT_PATH;
   try {
     const text = raw.startsWith("{") ? raw : fs.readFileSync(raw, "utf8");
     const parsed = JSON.parse(text);
@@ -1266,7 +1412,7 @@ async function sheetsFetch(token: string, pathAndQuery: string, init?: RequestIn
 }
 
 export function resolvePostingRoundColumns(headers: string[], round: number): { names: string[]; indexes: number[]; insertAt: number } {
-  const names = [`${round}차 게시`, `${round}차 게시 제목`, `${round}차 링크`, `${round}차 소개`];
+  const names = [`${round}차 게시`, `${round}차 게시 제목`, `${round}차 링크`, `${round}차 소계`];
   const indexes = names.map((name) => headers.indexOf(name));
   const existingCount = indexes.filter((index) => index >= 0).length;
   if (existingCount === 0) {
@@ -1279,10 +1425,18 @@ export function resolvePostingRoundColumns(headers: string[], round: number): { 
   return { names, indexes, insertAt: -1 };
 }
 
-// 회차 열이 없으면 게시·제목·링크·소개 열을 시트 끝에 함께 생성합니다.
+// 회차 열이 없으면 게시·제목·링크·소계 열을 시트 끝에 함께 생성합니다.
 async function recordRoundCreation({ boardId, title, postUrl, round }: { boardId: unknown; title: string; postUrl: string; round: number }): Promise<FormResult> {
   const serviceAccount = readServiceAccount();
-  if (!serviceAccount) return { ok: false, skipped: true, message: "" };
+  // 키가 없으면 조용히 넘어가지 말고 이유를 알립니다. 빈 메시지로 두면
+  // 게시는 성공했는데 시트만 비어 있는 상태를 사용자가 알 방법이 없습니다.
+  if (!serviceAccount) {
+    return {
+      ok: false,
+      skipped: true,
+      message: `시트 기록 생략: 서비스 계정 키가 없습니다. GOOGLE_SERVICE_ACCOUNT_KEY를 설정하거나 ${DEFAULT_SERVICE_ACCOUNT_PATH}에 키를 두세요.`,
+    };
+  }
 
   const match = /^(department|regional)-(.+)$/.exec(String(boardId ?? "").trim());
   if (!match) return { ok: false, message: "시트 기록 생략: 게시판 ID를 해석할 수 없습니다." };
@@ -1871,13 +2025,20 @@ async function prepareCreation(body: any): Promise<HttpResult> {
       };
     }
 
+    // 등록 직후 주소는 방송대 안내 페이지라, 목록에서 방금 올린 글의 실제 주소를 찾습니다.
+    const created = await resolveCreatedPostUrl(writePage, title);
+    const postUrl = created.url;
+    const linkNote = created.matched
+      ? ""
+      : " 목록에서 게시글 링크를 찾지 못해 목록 주소를 기록했습니다.";
+
     // 게시가 실제로 등록된 뒤에만 운영 시트의 해당 회차에 기록합니다.
     // 시트 기록 실패는 이미 성공한 게시를 무효화하지 않도록 안내 문구로만 반영합니다.
     let sheetNote = "";
     const recorded = await recordRoundCreation({
       boardId,
       title: title.trim(),
-      postUrl: writePage.url(),
+      postUrl,
       round: postRound,
     }).catch((error: any) => ({ ok: false, message: `시트 기록 오류: ${error?.message ?? error}` } as FormResult));
     if (recorded.message) sheetNote = ` ${recorded.message}`;
@@ -1887,8 +2048,8 @@ async function prepareCreation(body: any): Promise<HttpResult> {
       body: {
         ok: true,
         status: "submitted",
-        message: `${String(boardName || "선택한 게시판")} 게시글을 등록했습니다.${sheetNote}`,
-        pageUrl: writePage.url(),
+        message: `${String(boardName || "선택한 게시판")} 게시글을 등록했습니다.${linkNote}${sheetNote}`,
+        pageUrl: postUrl,
       },
     };
   }

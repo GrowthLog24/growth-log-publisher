@@ -22,7 +22,6 @@ let automationWindow: BrowserWindow | undefined;
 let automationPopupWindow: BrowserWindow | undefined;
 let pendingDeepLink = "";
 let isQuitting = false;
-let keepAutomationInBackground = false;
 
 async function reserveLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -207,23 +206,13 @@ async function createAutomationWindow(): Promise<BrowserWindow> {
   automationWindow.webContents.on("did-create-window", (window) => {
     automationPopupWindow = window;
     window.removeMenu();
-    window.on("minimize", () => {
-      keepAutomationInBackground = true;
-    });
-    window.on("close", () => {
-      if (!isQuitting) keepAutomationInBackground = true;
-    });
     window.on("closed", () => {
       if (automationPopupWindow === window) automationPopupWindow = undefined;
     });
   });
-  automationWindow.on("minimize", () => {
-    keepAutomationInBackground = true;
-  });
   automationWindow.on("close", (event) => {
     if (isQuitting) return;
     event.preventDefault();
-    keepAutomationInBackground = true;
     automationWindow?.hide();
   });
   automationWindow.on("closed", () => {
@@ -233,14 +222,16 @@ async function createAutomationWindow(): Promise<BrowserWindow> {
   return automationWindow;
 }
 
+// 자동화가 사람에게 화면을 넘길 때(검토 대기·오류 안내)는 창을 항상 다시 띄운다.
+// 사용자가 로그인 뒤 창을 닫아두는 것이 정상 흐름이라, 닫힘/최소화를 이유로
+// 표시를 건너뛰면 게시 요청이 보이지 않는 채로 끝난다. 포커스만 뺏지 않는다.
 function showAutomationWindow(force = false): void {
   const target = automationPopupWindow && !automationPopupWindow.isDestroyed()
     ? automationPopupWindow
     : automationWindow;
-  if (!target || target.isDestroyed() || (!force && keepAutomationInBackground)) return;
+  if (!target || target.isDestroyed()) return;
+  if (target.isMinimized()) target.restore();
   if (force) {
-    keepAutomationInBackground = false;
-    if (target.isMinimized()) target.restore();
     target.show();
     target.focus();
     return;

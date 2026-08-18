@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, dialog, nativeImage } from "electron";
+import { app, BrowserWindow, Menu, Tray, dialog, nativeImage, session } from "electron";
 import type { MenuItem } from "electron";
 import { readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -10,6 +10,7 @@ import type { startBrowserAutomation } from "./browser-automation.js";
 type Connector = Awaited<ReturnType<typeof startBrowserAutomation>>;
 
 const PROTOCOL = "growthlog-connector";
+const AUTOMATION_PARTITION = "persist:growth-log-automation";
 const AUTOMATION_PAGE_URL = "about:blank#growth-log-automation";
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const pairings = new Map<string, string>();
@@ -153,8 +154,16 @@ function showStatusWindow(): void {
 }
 
 async function createAutomationWindow(): Promise<BrowserWindow> {
+  // 방송대·티스토리 로그인 서버는 Electron/앱 이름이 붙은 User-Agent를 400으로 거부한다.
+  // 자동화 세션 UA에서 앱·Electron 토큰을 떼어내 일반 Chrome UA로 맞춘다.
+  const automationSession = session.fromPartition(AUTOMATION_PARTITION);
+  const chromeUserAgent = automationSession.getUserAgent()
+    .replace(/(like Gecko\))\s+.*?(\s+Chrome\/)/, "$1$2")
+    .replace(/\s+Electron\/\S+/, "");
+  automationSession.setUserAgent(chromeUserAgent);
+
   const automationWebPreferences = {
-    partition: "persist:growth-log-automation",
+    partition: AUTOMATION_PARTITION,
     contextIsolation: true,
     nodeIntegration: false,
     sandbox: true,

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createBrowserTaskQueue, startBrowserAutomation } from "../browser-automation.mjs";
+import { createBrowserTaskQueue, startBrowserAutomation } from "../src/browser-automation.js";
 
 test("runs concurrent browser requests one at a time and continues after a failure", async () => {
   const queue = createBrowserTaskQueue();
-  const order = [];
+  const order: string[] = [];
   let active = 0;
   let maxActive = 0;
-  const run = (name, fail = false) => queue.run(async () => {
+  const run = (name: string, fail = false) => queue.run(async () => {
     active += 1;
     maxActive = Math.max(maxActive, active);
     order.push(`${name}:start`);

@@ -5,16 +5,17 @@
   "private": true,
   "description": "Growth Log 운영 프로그램과 Electron 브라우저 자동화를 안전하게 연결하는 로컬 앱",
   "type": "module",
-  "main": "src/main.mjs",
+  "main": "dist/src/main.js",
   "scripts": {
-    "sync-automation": "node scripts/sync-browser-automation.mjs",
-    "prestart": "npm run sync-automation",
+    "build": "tsc && node -e \"require('fs').copyFileSync('src/status.html','dist/src/status.html')\"",
+    "prestart": "npm run build",
     "start": "electron .",
-    "prepackage": "npm run sync-automation",
+    "prepackage": "npm run build",
     "package": "electron-forge package",
-    "premake": "npm run sync-automation",
+    "premake": "npm run build",
     "make": "electron-forge make",
-    "test": "node --check browser-automation.mjs && node --test tests/*.test.mjs"
+    "pretest": "npm run build",
+    "test": "node --test dist/tests/*.test.js"
   },
   "dependencies": {
     "playwright-core": "1.61.1"
@@ -22,6 +23,8 @@
   "devDependencies": {
     "@electron-forge/cli": "^7.11.2",
     "@electron-forge/maker-zip": "^7.11.2",
-    "electron": "^43.2.0"
+    "@types/node": "^22.20.1",
+    "electron": "^43.2.0",
+    "typescript": "^5.4.5"
   }
 }

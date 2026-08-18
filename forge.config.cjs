@@ -5,8 +5,9 @@ module.exports = {
     appCategoryType: "public.app-category.productivity",
     executableName: "growth-log-connector",
     ignore: [
-      /^\/(?:\.browser-automation-profile|\.claude|\.git|\.knou-playwright-profile|\.npm-cache|out|outputs|scripts|tests)(?:\/|$)/,
-      /^\/(?:\.gitignore|README\.md|browser-automation\.mjs|forge\.config\.cjs|package-lock\.json)$/,
+      /^\/(?:\.browser-automation-profile|\.claude|\.git|\.knou-playwright-profile|\.npm-cache|out|outputs|scripts|src|tests)(?:\/|$)/,
+      /^\/dist\/tests(?:\/|$)/,
+      /^\/(?:\.gitignore|README\.md|forge\.config\.cjs|package-lock\.json|tsconfig\.json)$/,
     ],
     extendInfo: {
       CFBundleDisplayName: "Growth Log 연결 앱",
@@ -24,7 +25,7 @@ module.exports = {
   makers: [
     {
       name: "@electron-forge/maker-zip",
-      platforms: ["darwin"],
+      platforms: ["darwin", "win32"],
     },
   ],
 };
